@@ -329,7 +329,7 @@ t_stat cpu_set_instruction_set (UNIT *uptr, int32 val, CONST char *cptr, void *d
 t_stat cpu_show_instruction_set (FILE *st, UNIT *uptr, int32 val, CONST void *desc);
 const char *cpu_description (DEVICE *dptr);
 int32 cpu_get_vsw (int32 sw);
-static SIM_INLINE int32 get_istr (int32 lnt, int32 acc);
+static SIM_INLINE_FORCE int32 get_istr (int32 lnt, int32 acc);
 int32 ReadOcta (int32 va, int32 *opnd, int32 j, int32 acc);
 t_bool cpu_show_opnd (FILE *st, InstHistory *h, int32 line);
 t_stat cpu_show_hist_records (FILE *st, t_bool do_header, int32 start, int32 count);
@@ -3195,7 +3195,7 @@ for ( ;; ) {
    so any translation errors are real.
 */
 
-static SIM_INLINE int32 get_istr (int32 lnt, int32 acc)
+static SIM_INLINE_FORCE int32 get_istr (int32 lnt, int32 acc)
 {
 int32 bo = PC & 3;
 int32 sc, val, t;

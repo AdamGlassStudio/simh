@@ -299,12 +299,15 @@ typedef uint32          t_addr;
 
 #if defined(_MSC_VER)
 #define SIM_INLINE _inline
+#define SIM_INLINE_FORCE __forceinline
 #define SIM_NOINLINE _declspec (noinline)
 #elif defined(__GNUC__)
 #define SIM_INLINE inline
+#define SIM_INLINE_FORCE inline __attribute__ ((always_inline))
 #define SIM_NOINLINE  __attribute__ ((noinline))
 #else
 #define SIM_INLINE
+#define SIM_INLINE_FORCE
 #define SIM_NOINLINE
 #endif
 

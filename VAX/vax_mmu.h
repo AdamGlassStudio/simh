@@ -77,15 +77,15 @@ extern void WriteIO (uint32 pa, int32 val, int32 lnt);
 extern int32 ReadReg (uint32 pa, int32 lnt);
 extern void WriteReg (uint32 pa, int32 val, int32 lnt);
 extern TLBENT fill (uint32 va, int32 lnt, int32 acc, int32 *stat);
-static SIM_INLINE int32 ReadU (uint32 pa, int32 lnt);
-static SIM_INLINE void WriteU (uint32 pa, int32 val, int32 lnt);
-static SIM_INLINE int32 ReadB (uint32 pa);
-static SIM_INLINE int32 ReadW (uint32 pa);
-static SIM_INLINE int32 ReadL (uint32 pa);
-static SIM_INLINE int32 ReadLP (uint32 pa);
-static SIM_INLINE void WriteB (uint32 pa, int32 val);
-static SIM_INLINE void WriteW (uint32 pa, int32 val);
-static SIM_INLINE void WriteL (uint32 pa, int32 val);
+static SIM_INLINE_FORCE int32 ReadU (uint32 pa, int32 lnt);
+static SIM_INLINE_FORCE void WriteU (uint32 pa, int32 val, int32 lnt);
+static SIM_INLINE_FORCE int32 ReadB (uint32 pa);
+static SIM_INLINE_FORCE int32 ReadW (uint32 pa);
+static SIM_INLINE_FORCE int32 ReadL (uint32 pa);
+static SIM_INLINE_FORCE int32 ReadLP (uint32 pa);
+static SIM_INLINE_FORCE void WriteB (uint32 pa, int32 val);
+static SIM_INLINE_FORCE void WriteW (uint32 pa, int32 val);
+static SIM_INLINE_FORCE void WriteL (uint32 pa, int32 val);
 
 /* Read and write virtual
 
@@ -116,7 +116,7 @@ static SIM_INLINE void WriteL (uint32 pa, int32 val);
         returned data, right justified in 32b longword
 */
 
-static SIM_INLINE int32 Read (uint32 va, int32 lnt, int32 acc)
+static SIM_INLINE_FORCE int32 Read (uint32 va, int32 lnt, int32 acc)
 {
 int32 vpn, off, tbi, pa;
 int32 pa1, bo, sc, wl, wh;
@@ -182,7 +182,7 @@ else {
         none
 */
 
-static SIM_INLINE void Write (uint32 va, int32 val, int32 lnt, int32 acc)
+static SIM_INLINE_FORCE void Write (uint32 va, int32 val, int32 lnt, int32 acc)
 {
 int32 vpn, off, tbi, pa;
 int32 pa1, bo, sc;
@@ -272,7 +272,7 @@ return va & PAMASK;                                     /* ret phys addr */
         returned data, right justified in 32b longword
 */
 
-static SIM_INLINE int32 ReadB (uint32 pa)
+static SIM_INLINE_FORCE int32 ReadB (uint32 pa)
 {
 int32 dat;
 
@@ -288,7 +288,7 @@ else {
 return ((dat >> ((pa & 3) << 3)) & BMASK);
 }
 
-static SIM_INLINE int32 ReadW (uint32 pa)
+static SIM_INLINE_FORCE int32 ReadW (uint32 pa)
 {
 int32 dat;
 
@@ -304,7 +304,7 @@ else {
 return ((dat >> ((pa & 2)? 16: 0)) & WMASK);
 }
 
-static SIM_INLINE int32 ReadL (uint32 pa)
+static SIM_INLINE_FORCE int32 ReadL (uint32 pa)
 {
 if (ADDR_IS_MEM (pa))
     return M[pa >> 2];
@@ -314,7 +314,7 @@ if (ADDR_IS_IO (pa))
 return ReadReg (pa, L_LONG);
 }
 
-static SIM_INLINE int32 ReadLP (uint32 pa)
+static SIM_INLINE_FORCE int32 ReadLP (uint32 pa)
 {
 if (ADDR_IS_MEM (pa))
     return M[pa >> 2];
@@ -334,7 +334,7 @@ return ReadReg (pa, L_LONG);
         returned data
 */
 
-static SIM_INLINE int32 ReadU (uint32 pa, int32 lnt)
+static SIM_INLINE_FORCE int32 ReadU (uint32 pa, int32 lnt)
 {
 int32 dat;
 int32 sc = (pa & 3) << 3;
@@ -359,7 +359,7 @@ return ((dat >> sc) & insert[lnt]);
         none
 */
 
-static SIM_INLINE void WriteB (uint32 pa, int32 val)
+static SIM_INLINE_FORCE void WriteB (uint32 pa, int32 val)
 {
 if (ADDR_IS_MEM (pa)) {
     int32 id = pa >> 2;
@@ -377,7 +377,7 @@ else {
 return;
 }
 
-static SIM_INLINE void WriteW (uint32 pa, int32 val)
+static SIM_INLINE_FORCE void WriteW (uint32 pa, int32 val)
 {
 if (ADDR_IS_MEM (pa)) {
     int32 id = pa >> 2;
@@ -394,7 +394,7 @@ else {
 return;
 }
 
-static SIM_INLINE void WriteL (uint32 pa, int32 val)
+static SIM_INLINE_FORCE void WriteL (uint32 pa, int32 val)
 {
 if (ADDR_IS_MEM (pa))
     M[pa >> 2] = val;
@@ -408,7 +408,7 @@ else {
 return;
 }
 
-static SIM_INLINE void WriteLP (uint32 pa, int32 val)
+static SIM_INLINE_FORCE void WriteLP (uint32 pa, int32 val)
 {
 if (ADDR_IS_MEM (pa))
     M[pa >> 2] = val;
@@ -433,7 +433,7 @@ return;
         none
 */
 
-static SIM_INLINE void WriteU (uint32 pa, int32 val, int32 lnt)
+static SIM_INLINE_FORCE void WriteU (uint32 pa, int32 val, int32 lnt)
 {
 if (ADDR_IS_MEM (pa)) {
     int32 bo = pa & 3;
