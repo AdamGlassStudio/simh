@@ -134,8 +134,8 @@ DEVICE tlb_dev = {
         *stat = param; \
         return zero_pte; \
         } \
-    p1 = MM_PARAM (acc & TLB_WACC, param); \
-    p2 = va; \
+    fault_p1 = MM_PARAM (acc & TLB_WACC, param); \
+    fault_p2 = va; \
     ABORT ((param & PR_TNV)? ABORT_TNV: ABORT_ACV); }
 
 TLBENT fill (uint32 va, int32 lnt, int32 acc, int32 *stat)

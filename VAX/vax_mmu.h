@@ -59,9 +59,7 @@ typedef struct {
 extern uint32 *M;
 extern UNIT cpu_unit;
 extern DEVICE cpu_dev;
-extern int32 mapen;                                     /* map enable */
 
-extern int32 mchk_va, mchk_ref;                         /* for mcheck */
 extern TLBENT stlb[VA_TBSIZE], ptlb[VA_TBSIZE];
 
 static const int32 insert[4] = {

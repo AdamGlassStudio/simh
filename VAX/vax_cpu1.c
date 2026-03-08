@@ -1163,12 +1163,12 @@ if (cur < mode)                                         /* only inward */
 STK[cur] = SP;                                          /* save stack */
 tsp = STK[mode];                                        /* get new stk */
 acc = ACC_MASK (mode);                                  /* set new mode */
-if (Test (p2 = tsp - 1, WA, &sta) < 0) {                /* probe stk */
-    p1 = MM_WRITE | (sta & MM_EMASK);
+if (Test (fault_p2 = tsp - 1, WA, &sta) < 0) {                /* probe stk */
+    fault_p1 = MM_WRITE | (sta & MM_EMASK);
     ABORT ((sta & 4)? ABORT_TNV: ABORT_ACV);
     }
-if (Test (p2 = tsp - 12, WA, &sta) < 0) {
-    p1 = MM_WRITE | (sta & MM_EMASK);
+if (Test (fault_p2 = tsp - 12, WA, &sta) < 0) {
+    fault_p1 = MM_WRITE | (sta & MM_EMASK);
     ABORT ((sta & 4)? ABORT_TNV: ABORT_ACV);
     }
 Write (tsp - 12, SXTW (opnd[0]), L_LONG, WA);           /* push argument */
@@ -1389,8 +1389,8 @@ Test (ba, acc, &sta);                                   /* probe */
 switch (sta) {                                          /* case on status */
 
     case PR_PTNV:                                       /* pte TNV */
-        p1 = MM_PARAM (rw, PR_PTNV);
-        p2 = ba;
+        fault_p1 = MM_PARAM (rw, PR_PTNV);
+        fault_p2 = ba;
         ABORT (ABORT_TNV);                              /* force TNV */
 
     case PR_TNV: case PR_OK:                            /* TNV or ok */
@@ -1404,8 +1404,8 @@ Test (ba + length - 1, acc, &sta1);                     /* probe end addr */
 switch (sta1) {                                         /* case on status */
 
     case PR_PTNV:                                       /* pte TNV */
-        p1 = MM_PARAM (rw, PR_PTNV);
-        p2 = ba + length - 1;
+        fault_p1 = MM_PARAM (rw, PR_PTNV);
+        fault_p2 = ba + length - 1;
         ABORT (ABORT_TNV);                              /* force TNV */
 
     case PR_TNV: case PR_OK:                            /* TNV or ok */

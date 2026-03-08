@@ -77,7 +77,6 @@
 #define ABORT_ACV       (-SCB_ACV)                      /* access violation */
 #define ABORT_TNV       (-SCB_TNV)                      /* transl not vaid */
 #define ABORT(x)        longjmp (save_env, (x))         /* abort */
-extern jmp_buf save_env;
 #define RSVD_INST_FAULT(opc) do {                                                                       \
         char op_num[20];                                                                                \
         char const *opcd = opcode[opc];                                                                 \
@@ -94,18 +93,18 @@ extern jmp_buf save_env;
         sim_debug (LOG_CPU_FAULT_RSVD, &cpu_dev, #opc " fault_PC=%08x, PSL=%08x, SP=%08x, PC=%08x\n",   \
                                                  fault_PC, PSL, SP, PC);                                \
         ABORT (ABORT_RESOP); } while (0)
-#define FLT_OVFL_FAULT  p1 = FLT_OVRFLO, ABORT (ABORT_ARITH)
-#define FLT_DZRO_FAULT  p1 = FLT_DIVZRO, ABORT (ABORT_ARITH)
-#define FLT_UNFL_FAULT  p1 = FLT_UNDFLO, ABORT (ABORT_ARITH)
+#define FLT_OVFL_FAULT  fault_p1 = FLT_OVRFLO, ABORT (ABORT_ARITH)
+#define FLT_DZRO_FAULT  fault_p1 = FLT_DIVZRO, ABORT (ABORT_ARITH)
+#define FLT_UNFL_FAULT  fault_p1 = FLT_UNDFLO, ABORT (ABORT_ARITH)
 #define CMODE_FAULT(cd) do {                                                                            \
         sim_debug (LOG_CPU_FAULT_CMODE, &cpu_dev, #cd " fault_PC=%08x, PSL=%08x, SP=%08x, PC=%08x\n",   \
                                                  fault_PC, PSL, SP, PC);                                \
-        p1 = (cd);                                                                                      \
+        fault_p1 = (cd);                                                                                \
         ABORT (ABORT_CMODE); } while (0)
 #define MACH_CHECK(cd)  do {                                                                            \
         sim_debug (LOG_CPU_FAULT_MCHK, &cpu_dev, #cd " fault_PC=%08x, PSL=%08x, SP=%08x, PC=%08x\n",    \
                                                  fault_PC, PSL, SP, PC);                                \
-        p1 = (cd);                                                                                      \
+        fault_p1 = (cd);                                                                                \
         ABORT (ABORT_MCHK); } while (0)
 
 /* Logging */
@@ -838,7 +837,6 @@ enum opcodes {
 #define VAX_IDLE_ELN        0x40    /* VAXELN */
 #define VAX_IDLE_INFOSERVER 0x80    /* InfoServer */
 extern uint32 cpu_idle_mask;        /* idle mask */
-extern int32 extra_bytes;           /* bytes referenced by current string instruction */
 extern BITFIELD cpu_psl_bits[];
 extern char const * const opcode[];
 extern const uint16 drom[NUM_INST][MAX_SPEC + 1];
@@ -855,7 +853,7 @@ void cpu_idle (void);
 typedef struct {
     double              time;
     int32               iPC;
-    int32               PSL;
+    int32               psl;
     int32               opc;
     uint8               inst[INST_SIZE];
     uint32              opnd[OPND_SIZE];
@@ -863,32 +861,96 @@ typedef struct {
     } InstHistory;
 
 
-/* CPU Register definitions */
+/* VAX CPU state structure
 
-extern int32 R[16];                                     /* registers */
-extern int32 STK[5];                                    /* stack pointers */
-extern int32 PSL;                                       /* PSL */
-extern int32 SCBB;                                      /* SCB base */
-extern int32 PCBB;                                      /* PCB base */
-extern int32 SBR, SLR;                                  /* S0 mem mgt */                                          /* S0 mem mgt */
-extern int32 P0BR, P0LR;                                /* P0 mem mgt */
-extern int32 P1BR, P1LR;                                /* P1 mem mgt */
-extern int32 ASTLVL;                                    /* AST Level */
-extern int32 SISR;                                      /* swre int req */
-extern int32 pme;                                       /* perf mon enable */
-extern int32 trpirq;                                    /* trap/intr req */
-extern int32 fault_PC;                                  /* fault PC */
-extern int32 p1, p2;                                    /* fault parameters */
-extern int32 recq[];                                    /* recovery queue */
-extern int32 recqptr;                                   /* recq pointer */
-extern int32 pcq[PCQ_SIZE];                             /* PC queue */
-extern int32 pcq_p;                                     /* PC queue ptr */
-extern int32 in_ie;                                     /* in exc, int */
-extern int32 ibcnt, ppc;                                /* prefetch ctl */
-extern int32 hlt_pin;                                   /* HLT pin intr */
-extern int32 mxpr_cc_vc;                                /* cc V & C bits from mtpr/mfpr operations */
-extern int32 mem_err;
-extern int32 crd_err;
+   Groups all CPU register and execution state into a single first-class
+   object.  This enables pointer-based access for JIT code generation and
+   lays the groundwork for eventual multi-processor support.
+
+   Compatibility macros (below the struct) redirect the legacy global
+   names so that existing code compiles unchanged. */
+
+typedef struct {
+    int32               R[16];                          /* general registers */
+    int32               STK[5];                         /* stack pointers */
+    int32               PSL;                            /* processor status longword */
+    int32               SCBB;                           /* SCB base */
+    int32               PCBB;                           /* PCB base */
+    int32               P0BR;                           /* P0 mem mgt */
+    int32               P0LR;
+    int32               P1BR;                           /* P1 mem mgt */
+    int32               P1LR;
+    int32               SBR;                            /* S0 mem mgt */
+    int32               SLR;
+    int32               SISR;                           /* swre int req */
+    int32               ASTLVL;                         /* AST level */
+    int32               mapen;                          /* map enable */
+    int32               pme;                            /* perf mon enable */
+    int32               trpirq;                         /* trap/intr req */
+    int32               in_ie;                          /* in exc, int */
+    int32               recq[6];                        /* recovery queue */
+    int32               recqptr;                        /* recq pointer */
+    int32               hlt_pin;                        /* HLT pin intr */
+    int32               mem_err;
+    int32               crd_err;
+    int32               fault_p1, fault_p2;              /* fault parameters */
+    int32               fault_PC;                       /* fault PC */
+    int32               mxpr_cc_vc;                     /* MxPR V,C bits */
+    int32               mchk_va, mchk_ref;              /* mem ref param */
+    int32               ibufl, ibufh;                   /* prefetch buf */
+    int32               ibcnt, ppc;                     /* prefetch ctl */
+    int32               pcq[PCQ_SIZE];                  /* PC queue */
+    int32               pcq_p;                          /* PC queue ptr */
+    int32               badabo;
+    int32               cpu_astop;
+    int32               extra_bytes;                    /* bytes for string instr */
+    jmp_buf             save_env;                       /* abort handler */
+    } VAXCPUState;
+
+extern VAXCPUState cpu_state;
+
+/* Compatibility macros — redirect legacy names to struct members.
+   These rely on the C preprocessor's self-reference suppression
+   (6.10.3.4 "blue paint" rule) for names that match their field. */
+
+#define R               (cpu_state.R)
+#define STK             (cpu_state.STK)
+#define PSL             (cpu_state.PSL)
+#define SCBB            (cpu_state.SCBB)
+#define PCBB            (cpu_state.PCBB)
+#define P0BR            (cpu_state.P0BR)
+#define P0LR            (cpu_state.P0LR)
+#define P1BR            (cpu_state.P1BR)
+#define P1LR            (cpu_state.P1LR)
+#define SBR             (cpu_state.SBR)
+#define SLR             (cpu_state.SLR)
+#define SISR            (cpu_state.SISR)
+#define ASTLVL          (cpu_state.ASTLVL)
+#define mapen           (cpu_state.mapen)
+#define pme             (cpu_state.pme)
+#define trpirq          (cpu_state.trpirq)
+#define in_ie           (cpu_state.in_ie)
+#define recq            (cpu_state.recq)
+#define recqptr         (cpu_state.recqptr)
+#define hlt_pin         (cpu_state.hlt_pin)
+#define mem_err         (cpu_state.mem_err)
+#define crd_err         (cpu_state.crd_err)
+#define fault_p1        (cpu_state.fault_p1)
+#define fault_p2        (cpu_state.fault_p2)
+#define fault_PC        (cpu_state.fault_PC)
+#define mxpr_cc_vc      (cpu_state.mxpr_cc_vc)
+#define mchk_va         (cpu_state.mchk_va)
+#define mchk_ref        (cpu_state.mchk_ref)
+#define ibufl           (cpu_state.ibufl)
+#define ibufh           (cpu_state.ibufh)
+#define ibcnt           (cpu_state.ibcnt)
+#define ppc             (cpu_state.ppc)
+#define pcq             (cpu_state.pcq)
+#define pcq_p           (cpu_state.pcq_p)
+#define badabo          (cpu_state.badabo)
+#define cpu_astop       (cpu_state.cpu_astop)
+#define extra_bytes     (cpu_state.extra_bytes)
+#define save_env        (cpu_state.save_env)
 
 /* vax_cpu1.c externals */
 extern int32 op_bb_n (int32 *opnd, int32 acc);

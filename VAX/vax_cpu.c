@@ -235,38 +235,8 @@
 
 
 uint32 *M = NULL;                                       /* memory */
-int32 R[16];                                            /* registers */
-int32 STK[5];                                           /* stack pointers */
-int32 PSL;                                              /* PSL */
-int32 SCBB = 0;                                         /* SCB base */
-int32 PCBB = 0;                                         /* PCB base */
-int32 P0BR = 0;                                         /* P0 mem mgt */
-int32 P0LR = 0;
-int32 P1BR = 0;                                         /* P1 mem mgt */
-int32 P1LR = 0;
-int32 SBR = 0;                                          /* S0 mem mgt */
-int32 SLR = 0;
-int32 SISR;                                             /* swre int req */
-int32 ASTLVL;                                           /* AST level */
-int32 mapen;                                            /* map enable */
-int32 pme;                                              /* perf mon enable */
-int32 trpirq;                                           /* trap/intr req */
-int32 in_ie = 0;                                        /* in exc, int */
-int32 recq[6];                                          /* recovery queue */
-int32 recqptr;                                          /* recq pointer */
-int32 hlt_pin = 0;                                      /* HLT pin intr */
-int32 mem_err = 0;
-int32 crd_err = 0;
-int32 p1 = 0, p2 = 0;                                   /* fault parameters */
-int32 fault_PC;                                         /* fault PC */
-int32 mxpr_cc_vc = 0;                                   /* MxPR V,C bits */
-int32 pcq_p = 0;                                        /* PC queue ptr */
-int32 badabo = 0;
+VAXCPUState cpu_state;                                  /* CPU state */
 int32 cpu_instruction_set = CPU_INSTRUCTION_SET;        /* Instruction Groups  */
-int32 cpu_astop = 0;
-int32 mchk_va, mchk_ref;                                /* mem ref param */
-int32 ibufl, ibufh;                                     /* prefetch buf */
-int32 ibcnt, ppc;                                       /* prefetch ctl */
 uint32 cpu_idle_mask =                                  /* idle mask */
 #if defined (VAX_411) || defined (VAX_412)
                        VAX_IDLE_INFOSERVER;
@@ -275,10 +245,7 @@ uint32 cpu_idle_type = 2;                               /* default INFOSERVER */
                        VAX_IDLE_VMS;
 uint32 cpu_idle_type = 1;                               /* default VMS */
 #endif
-int32 extra_bytes;                                      /* bytes referenced by current string instruction */
-jmp_buf save_env;
 REG *pcq_r = NULL;                                      /* PC queue reg ptr */
-int32 pcq[PCQ_SIZE] = { 0 };                            /* PC queue */
 InstHistory *hst = NULL;                                /* instruction history */
 int32 hst_p = 0;                                        /* history pointer */
 int32 hst_lnt = 0;                                      /* history length */
@@ -564,7 +531,7 @@ else if (abortval < 0) {                                /* mm or rsrv or int */
         cc = intexc (-abortval, cc, 0, IE_EXC);         /* take exception */
         GET_CUR;
         in_ie = 1;
-        Write (SP - 4, p1, L_LONG, WA);                 /* write arith param */
+        Write (SP - 4, fault_p1, L_LONG, WA);                 /* write arith param */
         SP = SP - 4;
         in_ie = 0;
         break;
@@ -581,8 +548,8 @@ else if (abortval < 0) {                                /* mm or rsrv or int */
             cc = intexc (-abortval, cc, 0, IE_EXC);     /* take exception */
             GET_CUR;
             in_ie = 1;
-            Write (SP - 8, p1, L_LONG, WA);             /* write mm params */
-            Write (SP - 4, p2, L_LONG, WA);
+            Write (SP - 8, fault_p1, L_LONG, WA);             /* write mm params */
+            Write (SP - 4, fault_p2, L_LONG, WA);
             SP = SP - 8;
             in_ie = 0;
             }
@@ -590,8 +557,8 @@ else if (abortval < 0) {                                /* mm or rsrv or int */
 
     case SCB_MCHK:                                      /* machine check */
         sim_debug (LOG_CPU_FAULT_MCHK, &cpu_dev, "%s fault_PC=%08x, PSL=%08x, cc=%08x, PC=%08x, delta-%08X, p1=%08X\n",
-                                                 opcode[opc], fault_PC, PSL, cc, PC, delta, p1);
-        cc = machine_check (p1, opc, cc, delta);        /* system specific */
+                                                 opcode[opc], fault_PC, PSL, cc, PC, delta, fault_p1);
+        cc = machine_check (fault_p1, opc, cc, delta);        /* system specific */
         in_ie = 0;
         GET_CUR;                                        /* PSL<cur> changed */
         break;
@@ -1566,7 +1533,7 @@ for ( ;; ) {
         InstHistory *h = &hst[hst_p];
 
         h->iPC = fault_PC;
-        h->PSL = PSL | cc;
+        h->psl = PSL | cc;
         h->opc = opc;
         for (i = 0; i < j; i++)
             h->opnd[i] = opnd[i];
@@ -3635,11 +3602,11 @@ for (k = 0; k < count; k++) {                           /* print specified */
         continue;
     if (hst_switches & SWMASK('T'))                     /* sim_time */
         fprintf(st, "%10.0f  ", h->time);
-    fprintf(st, "%08X %08X| ", h->iPC, h->PSL);         /* PC, PSL */
+    fprintf(st, "%08X %08X| ", h->iPC, h->psl);         /* PC, PSL */
     numspec = DR_GETNSP (drom[h->opc][0]);              /* #specifiers */
     if (opcode[h->opc] == NULL)                         /* undefined? */
         fprintf (st, "%03X (undefined)", h->opc);
-    else if (h->PSL & PSL_FPD)                          /* FPD set? */
+    else if (h->psl & PSL_FPD)                          /* FPD set? */
         fprintf (st, "%s FPD set", opcode[h->opc]);
     else {                                              /* normal */
         for (i = 0; i < INST_SIZE; i++)
