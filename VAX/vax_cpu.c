@@ -709,24 +709,31 @@ for ( ;; ) {
     numspec = drom[opc][0];                             /* get # specs */
 
     /* JIT Option A hook: attempt JIT before interpreter operand decode.
-       Spec bytes are read here (get_istr is static to this file) and
-       passed to vax_jit_execute as raw specifier bytes.  If the JIT
+       Operands are decoded here (get_istr is static to this file) and
+       passed to vax_jit_execute as VaxJITOperand structs.  If the JIT
        returns 1 the instruction is fully handled — continue the loop.
        If the JIT returns 0 (unsupported operand mode or opcode), restore
-       the prefetch state so the interpreter spec loop sees intact bytes. */
+       the prefetch state so the interpreter spec loop sees intact bytes.
+       Immediate operand lengths come from drom so byte/word/long ops
+       are all handled correctly.                                       */
     {
-        int jit_nspc = vax_jit_enabled ? vax_jit_nspecs(opc) : -1;
-        if (jit_nspc >= 0) {
-            int32 specs[2]    = {0, 0};
-            int32 sv_pc       = PC;
-            int32 sv_ibufl    = ibufl,  sv_ibufh = ibufh;
-            int32 sv_ibcnt    = ibcnt,  sv_ppc   = ppc;
+        int jit_nops = vax_jit_enabled ? vax_jit_noperands(opc) : -1;
+        if (jit_nops >= 0) {
+            VaxJITOperand ops[MAX_SPEC];
+            int32 sv_pc    = PC;
+            int32 sv_ibufl = ibufl,  sv_ibufh = ibufh;
+            int32 sv_ibcnt = ibcnt,  sv_ppc   = ppc;
             int   i;
-            for (i = 0; i < jit_nspc && i < 2; i++)
-                specs[i] = get_istr(L_BYTE, acc);
-            if (vax_jit_execute(opc, &cpu_state, specs, jit_nspc))
+            for (i = 0; i < jit_nops; i++) {
+                int32 spec   = get_istr(L_BYTE, acc);
+                int32 follow = 0;
+                if (vax_jit_operand_needs_long(spec))
+                    follow = get_istr(DR_LNT(drom[opc][i + 1]), acc);
+                vax_jit_decode_operand(spec, follow, &ops[i]);
+            }
+            if (vax_jit_execute(opc, &cpu_state, ops, jit_nops))
                 continue;
-            /* JIT declined (unsupported mode) — restore prefetch state */
+            /* JIT declined — restore prefetch state */
             PC    = sv_pc;
             ibufl = sv_ibufl; ibufh = sv_ibufh;
             ibcnt = sv_ibcnt; ppc   = sv_ppc;

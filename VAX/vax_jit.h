@@ -14,33 +14,77 @@
 
 #include "vax_defs.h"
 
-/* Initialise / shut down the LLVM ORC JIT engine.
-   Call vax_jit_init() once at simulator startup (cpu_reset).
-   Call vax_jit_destroy() at simulator exit.                        */
-int  vax_jit_init    (void);
-void vax_jit_destroy (void);
+/* ------------------------------------------------------------------
+   VAX specifier mode nibble constants (high nibble of each spec byte).
+   The full VAX Architecture Reference Manual defines these (ch. 3).
+   ------------------------------------------------------------------ */
+#define VAX_SPEC_SHORT_LIT_MAX  0x03    /* modes 0–3: short literal       */
+#define VAX_SPEC_INDEX          0x04
+#define VAX_SPEC_REGISTER       0x05    /* mode 5: register direct        */
+#define VAX_SPEC_REG_DEFERRED   0x06
+#define VAX_SPEC_AUTODECREMENT  0x07
+#define VAX_SPEC_AUTOINCREMENT  0x08    /* +PC (reg=15): immediate        */
+#define VAX_SPEC_AUTOINC_DEF    0x09    /* +PC: absolute                  */
+#define VAX_SPEC_BYTE_DISP      0x0A    /* +PC: byte PC-relative          */
+#define VAX_SPEC_BYTE_DISP_DEF  0x0B
+#define VAX_SPEC_WORD_DISP      0x0C    /* +PC: word PC-relative          */
+#define VAX_SPEC_WORD_DISP_DEF  0x0D
+#define VAX_SPEC_LONG_DISP      0x0E    /* +PC: longword PC-relative      */
+#define VAX_SPEC_LONG_DISP_DEF  0x0F
 
-/* How many specifier bytes the JIT needs to read before calling vax_jit_execute.
-   Returns -1 if the opcode is not JIT-handled (skip the JIT entirely).
-   Returns  0 for zero-operand instructions (NOP).
-   Returns  N for N single-byte specifiers.
-   The caller (vax_cpu.c) reads exactly this many bytes from the instruction
-   stream and saves/restores the prefetch state on JIT miss.          */
-int  vax_jit_nspecs  (int32 opc);
+/* Convenience macros on a raw specifier byte */
+#define VAX_SPEC_MODE(s)    (((s) >> 4) & 0xF)
+#define VAX_SPEC_REG(s)     ((s) & 0xF)
+#define VAX_SPEC_IS_SHORT_LIT(s)  (VAX_SPEC_MODE(s) <= VAX_SPEC_SHORT_LIT_MAX)
+#define VAX_SPEC_IS_IMMEDIATE(s)  (VAX_SPEC_MODE(s) == VAX_SPEC_AUTOINCREMENT \
+                                   && VAX_SPEC_REG(s) == nPC)
+
+/* ------------------------------------------------------------------
+   Decoded operand: built by vax_jit_decode_operand() in vax_jit.c.
+   The Option A hook in vax_cpu.c reads the raw bytes; this struct
+   carries the semantic result so all instruction handlers share one
+   decode path.
+   ------------------------------------------------------------------ */
+
+typedef enum {
+    JITOPK_UNSUPPORTED = 0, /* mode not yet handled — fall to interpreter */
+    JITOPK_REGISTER,        /* R[reg]                                      */
+    JITOPK_LITERAL,         /* short literal 0–63, value in .imm           */
+    JITOPK_IMMEDIATE        /* longword immediate, value in .imm           */
+} VaxJITOpKind;
+
+typedef struct {
+    VaxJITOpKind kind;
+    int          reg;   /* register index (JITOPK_REGISTER only)          */
+    int32        imm;   /* value (JITOPK_LITERAL / JITOPK_IMMEDIATE)      */
+} VaxJITOperand;
+
+/* Decode one operand from a specifier byte (already read from the stream)
+   and an optional follow longword (only consumed for immediate mode).
+   Result written into *op.                                               */
+void vax_jit_decode_operand (int32 spec, int32 follow, VaxJITOperand *op);
+
+/* Returns 1 if the specifier byte requires a following longword to be
+   read from the instruction stream (immediate longword: 0x8F).
+   The caller (vax_cpu.c) uses this to know whether to call
+   get_istr(L_LONG) after the spec byte.                                  */
+int  vax_jit_operand_needs_long (int32 spec);
+
+/* How many operands the JIT expects for this opcode.
+   -1 = opcode not JIT-handled (skip hook entirely).
+    0 = no operands (NOP).
+    N = N operands to decode.                                             */
+int  vax_jit_noperands (int32 opc);
 
 /* Attempt to JIT-execute one instruction.
-   opc   - VAX opcode
-   state - pointer to live VAXCPUState
-   specs - specifier bytes already read from the instruction stream
-           (vax_jit_nspecs(opc) of them); NULL for zero-specifier instructions
-   nspecs - number of entries in specs[]
-
-   Returns 1 if the JIT handled the instruction (caller should `continue`
-   the main dispatch loop — interpreter must NOT also run it).
-   Returns 0 if the JIT did not handle it (caller must restore the prefetch
-   state to undo any specifier bytes that were consumed).             */
+   Returns 1 if handled (caller continues dispatch loop, interpreter skipped).
+   Returns 0 if not handled (caller must restore prefetch state).         */
 int  vax_jit_execute (int32 opc, VAXCPUState *state,
-                      int32 *specs, int nspecs);
+                      VaxJITOperand *ops, int nops);
+
+/* Initialise / shut down the LLVM ORC JIT engine.                       */
+int  vax_jit_init    (void);
+void vax_jit_destroy (void);
 
 /* 1 when JIT is enabled (SET CPU JIT), 0 when disabled (SET CPU NOJIT). */
 extern int vax_jit_enabled;

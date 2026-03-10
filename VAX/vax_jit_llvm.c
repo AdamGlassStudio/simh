@@ -137,11 +137,15 @@ static int jit_nop(void)
 /*   C = (uint32)result < (uint32)dst_old                               */
 /* ------------------------------------------------------------------ */
 
-static int jit_addl2(int32_t *regs, int32_t *psl, int src_idx, int dst_idx)
+/* src_is_const: 0 = register operand (src_val is reg index),
+                 1 = constant operand (src_val is the literal/immediate value).
+   When src_is_const, the IR uses LLVMConstInt instead of GEP+load so LLVM
+   sees a compile-time constant and can fold it away in later optimisation. */
+static int jit_addl2(int32_t *regs, int32_t *psl,
+                     int src_is_const, int32_t src_val, int dst_reg)
 {
     LLVMModuleRef              mod;
     LLVMBuilderRef             builder;
-    LLVMTypeRef                param_types[4];
     LLVMTypeRef                fn_type;
     LLVMValueRef               fn;
     LLVMBasicBlockRef          entry_bb;
@@ -149,18 +153,16 @@ static int jit_addl2(int32_t *regs, int32_t *psl, int src_idx, int dst_idx)
     LLVMOrcJITDylibRef         dylib;
     LLVMErrorRef               err;
     LLVMOrcExecutorAddress     addr = 0;
-    void (*fn_ptr)(int32_t *, int32_t *, int32_t, int32_t);
+    void                       (*fn_ptr)(int32_t *, int32_t *, int32_t);
 
     LLVMTypeRef i32  = LLVMInt32TypeInContext(ctx);
     LLVMTypeRef ptr  = LLVMPointerTypeInContext(ctx, 0);  /* opaque ptr */
 
-    /* Build: void @vax_addl2(ptr %regs, ptr %psl, i32 %src_idx, i32 %dst_idx) */
-    param_types[0] = ptr;
-    param_types[1] = ptr;
-    param_types[2] = i32;
-    param_types[3] = i32;
+    /* Build: void @vax_addl2(ptr %regs, ptr %psl, i32 %dst_reg)
+       src is either a GEP+load (register) or a ConstInt (literal/immediate). */
+    LLVMTypeRef param_types[3] = { ptr, ptr, i32 };
     mod     = LLVMModuleCreateWithNameInContext("vax_addl2_mod", ctx);
-    fn_type = LLVMFunctionType(LLVMVoidTypeInContext(ctx), param_types, 4, 0);
+    fn_type = LLVMFunctionType(LLVMVoidTypeInContext(ctx), param_types, 3, 0);
     fn      = LLVMAddFunction(mod, "vax_addl2", fn_type);
     entry_bb = LLVMAppendBasicBlockInContext(ctx, fn, "entry");
     builder  = LLVMCreateBuilderInContext(ctx);
@@ -168,12 +170,17 @@ static int jit_addl2(int32_t *regs, int32_t *psl, int src_idx, int dst_idx)
 
     LLVMValueRef v_regs    = LLVMGetParam(fn, 0);
     LLVMValueRef v_psl     = LLVMGetParam(fn, 1);
-    LLVMValueRef v_src_idx = LLVMGetParam(fn, 2);
-    LLVMValueRef v_dst_idx = LLVMGetParam(fn, 3);
+    LLVMValueRef v_dst_idx = LLVMGetParam(fn, 2);
 
-    /* src = regs[src_idx] */
-    LLVMValueRef src_ptr = LLVMBuildGEP2(builder, i32, v_regs, &v_src_idx, 1, "src_ptr");
-    LLVMValueRef src     = LLVMBuildLoad2(builder, i32, src_ptr, "src");
+    /* src: constant fold if literal/immediate, otherwise load from regs[] */
+    LLVMValueRef src;
+    if (src_is_const) {
+        src = LLVMConstInt(i32, (unsigned)src_val, 1);   /* sign-extend */
+    } else {
+        LLVMValueRef sv  = LLVMConstInt(i32, (unsigned)src_val, 0);
+        LLVMValueRef sptr = LLVMBuildGEP2(builder, i32, v_regs, &sv, 1, "src_ptr");
+        src = LLVMBuildLoad2(builder, i32, sptr, "src");
+    }
 
     /* dst_old = regs[dst_idx] */
     LLVMValueRef dst_ptr = LLVMBuildGEP2(builder, i32, v_regs, &v_dst_idx, 1, "dst_ptr");
@@ -245,16 +252,22 @@ static int jit_addl2(int32_t *regs, int32_t *psl, int src_idx, int dst_idx)
         return 0;
     }
 
-    fn_ptr = (void (*)(int32_t *, int32_t *, int32_t, int32_t))(uintptr_t)addr;
-    fn_ptr(regs, psl, (int32_t)src_idx, (int32_t)dst_idx);
-    fprintf(stdout, "vax_jit: executed ADDL2 R%d, R%d via JIT\n", src_idx, dst_idx);
+    fn_ptr = (void (*)(int32_t *, int32_t *, int32_t))(uintptr_t)addr;
+    fn_ptr(regs, psl, (int32_t)dst_reg);
+    if (src_is_const)
+        fprintf(stdout, "vax_jit: executed ADDL2 #%d, R%d via JIT\n",
+                src_val, dst_reg);
+    else
+        fprintf(stdout, "vax_jit: executed ADDL2 R%d, R%d via JIT\n",
+                src_val, dst_reg);
     return 1;
 }
 
-int vax_jit_llvm_addl2(int32_t *regs, int32_t *psl, int src, int dst)
+int vax_jit_llvm_addl2(int32_t *regs, int32_t *psl,
+                       int src_is_const, int32_t src_val, int dst_reg)
 {
     if (!jit) return 0;
-    return jit_addl2(regs, psl, src, dst);
+    return jit_addl2(regs, psl, src_is_const, src_val, dst_reg);
 }
 
 int vax_jit_llvm_nop(void)
