@@ -5,11 +5,12 @@
  * never mix with SIMH's own short-name macros (BB, FP, SP, PC, etc.)
  * which would cause collisions.
  *
- * The public API uses only int and void* — see vax_jit.h for the
- * SIMH-facing wrapper that maps VAXCPUState to these primitives.
+ * All JIT handlers are compiled once during vax_jit_llvm_init() and
+ * cached as native function pointers.  Subsequent calls just invoke
+ * the cached pointer — no per-call recompilation.
  *
  * Build requires: -I/usr/include/llvm-c-18
- *                 -I/usr/lib/llvm-18/include   (for llvm/Config/)
+ *                 -I/usr/lib/llvm-18/include
  *                 -lLLVM-18
  */
 
@@ -25,6 +26,22 @@
 #include <stdlib.h>
 
 /* ------------------------------------------------------------------ */
+/* Integer ALU operation kinds                                          */
+/* Keep in sync with the matching enum in vax_jit.c.                   */
+/* ------------------------------------------------------------------ */
+
+typedef enum {
+    VAX_INTL_ADD     = 0,   /* dst + src,   CC_ADD                        */
+    VAX_INTL_SUB     = 1,   /* dst - src,   CC_SUB                        */
+    VAX_INTL_OR      = 2,   /* dst | src,   CC_LOG (V=0,C=0)              */
+    VAX_INTL_AND_NOT = 3,   /* dst & ~src,  CC_LOG                        */
+    VAX_INTL_XOR     = 4,   /* dst ^ src,   CC_LOG                        */
+    VAX_INTL_MOV     = 5,   /* src,         CC_LOG (dst_old ignored)      */
+    VAX_INTL_COM     = 6,   /* ~src,        CC_LOG (dst_old ignored)      */
+    VAX_INTL_NOPS    = 7
+} VaxIntOpL;
+
+/* ------------------------------------------------------------------ */
 /* LLVM / ORC state                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -38,13 +55,347 @@ static void llvm_fatal(const char *reason)
 }
 
 /* ------------------------------------------------------------------ */
+/* Compiled handler cache                                               */
+/* ------------------------------------------------------------------ */
+
+/* intl2: void fn(regs, psl, src_is_const, src_val, dst_reg) */
+typedef void (*IntL2Fn)(int32_t *, int32_t *, int32_t, int32_t, int32_t);
+/* cmpl:  void fn(regs, psl, s1_is_const, s1_val, s2_is_const, s2_val) */
+typedef void (*CmpLFn)(int32_t *, int32_t *, int32_t, int32_t, int32_t, int32_t);
+/* tstl:  void fn(regs, psl, src_is_const, src_val) */
+typedef void (*TstLFn)(int32_t *, int32_t *, int32_t, int32_t);
+/* nop:   void fn(void) */
+typedef void (*NopFn)(void);
+
+static IntL2Fn fn_intl2[VAX_INTL_NOPS];
+static CmpLFn  fn_cmpl;
+static TstLFn  fn_tstl;
+static NopFn   fn_nop;
+
+/* ------------------------------------------------------------------ */
+/* IR build helpers                                                     */
+/* ------------------------------------------------------------------ */
+
+/* Resolve a "maybe-const" source operand.
+   is_const != 0  → use val as a sign-extended literal.
+   is_const == 0  → load from regs[val].
+   A safe index (0) is used for the GEP when const so that val (which may
+   be a literal up to 63) never indexes out of the 16-entry register file. */
+static LLVMValueRef build_resolve(LLVMBuilderRef b, LLVMTypeRef i32,
+                                   LLVMValueRef v_regs,
+                                   LLVMValueRef v_ic, LLVMValueRef v_val)
+{
+    LLVMValueRef zero     = LLVMConstInt(i32, 0, 0);
+    LLVMValueRef is_c     = LLVMBuildICmp(b, LLVMIntNE, v_ic, zero, "is_c");
+    LLVMValueRef safe_idx = LLVMBuildSelect(b, is_c, zero, v_val, "sidx");
+    LLVMValueRef ptr      = LLVMBuildGEP2(b, i32, v_regs, &safe_idx, 1, "rp");
+    LLVMValueRef loaded   = LLVMBuildLoad2(b, i32, ptr, "rv");
+    return LLVMBuildSelect(b, is_c, v_val, loaded, "src");
+}
+
+/* CC bits for addition (result = dst + src): N,Z,V,C */
+static LLVMValueRef build_cc_add(LLVMBuilderRef b, LLVMTypeRef i32,
+                                  LLVMValueRef src, LLVMValueRef dst_old,
+                                  LLVMValueRef result)
+{
+    LLVMValueRef z    = LLVMConstInt(i32, 0, 0);
+    LLVMValueRef sign = LLVMConstInt(i32, 0x80000000u, 0);
+    LLVMValueRef cn   = LLVMConstInt(i32, 0x08, 0);
+    LLVMValueRef cz   = LLVMConstInt(i32, 0x04, 0);
+    LLVMValueRef cv   = LLVMConstInt(i32, 0x02, 0);
+    LLVMValueRef cc   = LLVMConstInt(i32, 0x01, 0);
+
+    LLVMValueRef nb = LLVMBuildSelect(b,
+        LLVMBuildICmp(b, LLVMIntSLT, result, z, "nc"), cn, z, "n");
+    LLVMValueRef zb = LLVMBuildSelect(b,
+        LLVMBuildICmp(b, LLVMIntEQ,  result, z, "zc"), cz, z, "z");
+
+    /* V: (~src ^ dst_old) & (src ^ result) has bit 31 set */
+    LLVMValueRef t1   = LLVMBuildXor(b, LLVMBuildNot(b, src, "ns"), dst_old, "t1");
+    LLVMValueRef t2   = LLVMBuildXor(b, src, result, "t2");
+    LLVMValueRef vm   = LLVMBuildAnd(b, LLVMBuildAnd(b, t1, t2, "t3"), sign, "vm");
+    LLVMValueRef vb   = LLVMBuildSelect(b,
+        LLVMBuildICmp(b, LLVMIntNE, vm, z, "vc"), cv, z, "v");
+
+    /* C: (uint32)result < (uint32)dst_old */
+    LLVMValueRef cb   = LLVMBuildSelect(b,
+        LLVMBuildICmp(b, LLVMIntULT, result, dst_old, "cc_c"), cc, z, "c");
+
+    return LLVMBuildOr(b,
+               LLVMBuildOr(b, LLVMBuildOr(b, nb, zb, "nz"), vb, "nzv"),
+               cb, "cc");
+}
+
+/* CC bits for subtraction (result = dst - src): N,Z,V,C */
+static LLVMValueRef build_cc_sub(LLVMBuilderRef b, LLVMTypeRef i32,
+                                  LLVMValueRef src, LLVMValueRef dst_old,
+                                  LLVMValueRef result)
+{
+    LLVMValueRef z    = LLVMConstInt(i32, 0, 0);
+    LLVMValueRef sign = LLVMConstInt(i32, 0x80000000u, 0);
+    LLVMValueRef cn   = LLVMConstInt(i32, 0x08, 0);
+    LLVMValueRef cz   = LLVMConstInt(i32, 0x04, 0);
+    LLVMValueRef cv   = LLVMConstInt(i32, 0x02, 0);
+    LLVMValueRef cc   = LLVMConstInt(i32, 0x01, 0);
+
+    LLVMValueRef nb = LLVMBuildSelect(b,
+        LLVMBuildICmp(b, LLVMIntSLT, result, z, "nc"), cn, z, "n");
+    LLVMValueRef zb = LLVMBuildSelect(b,
+        LLVMBuildICmp(b, LLVMIntEQ,  result, z, "zc"), cz, z, "z");
+
+    /* V: (dst ^ src) & (dst ^ result) has bit 31 set */
+    LLVMValueRef t1   = LLVMBuildAnd(b,
+                            LLVMBuildXor(b, dst_old, src,    "t1"),
+                            LLVMBuildXor(b, dst_old, result, "t2"), "t3");
+    LLVMValueRef vm   = LLVMBuildAnd(b, t1, sign, "vm");
+    LLVMValueRef vb   = LLVMBuildSelect(b,
+        LLVMBuildICmp(b, LLVMIntNE, vm, z, "vc"), cv, z, "v");
+
+    /* C: borrow = (uint32)src > (uint32)dst_old */
+    LLVMValueRef cb   = LLVMBuildSelect(b,
+        LLVMBuildICmp(b, LLVMIntUGT, src, dst_old, "cc_c"), cc, z, "c");
+
+    return LLVMBuildOr(b,
+               LLVMBuildOr(b, LLVMBuildOr(b, nb, zb, "nz"), vb, "nzv"),
+               cb, "cc");
+}
+
+/* CC bits for logical ops: N,Z set; V=0,C=0 */
+static LLVMValueRef build_cc_logical(LLVMBuilderRef b, LLVMTypeRef i32,
+                                      LLVMValueRef result)
+{
+    LLVMValueRef z  = LLVMConstInt(i32, 0, 0);
+    LLVMValueRef cn = LLVMConstInt(i32, 0x08, 0);
+    LLVMValueRef cz = LLVMConstInt(i32, 0x04, 0);
+    LLVMValueRef nb = LLVMBuildSelect(b,
+        LLVMBuildICmp(b, LLVMIntSLT, result, z, "nc"), cn, z, "n");
+    LLVMValueRef zb = LLVMBuildSelect(b,
+        LLVMBuildICmp(b, LLVMIntEQ,  result, z, "zc"), cz, z, "z");
+    return LLVMBuildOr(b, nb, zb, "cc");
+}
+
+/* PSL = (PSL & ~0xF) | cc_bits */
+static void build_psl_update(LLVMBuilderRef b, LLVMTypeRef i32,
+                              LLVMValueRef v_psl, LLVMValueRef cc)
+{
+    LLVMValueRef old  = LLVMBuildLoad2(b, i32, v_psl, "po");
+    LLVMValueRef mask = LLVMConstInt(i32, 0xFFFFFFF0u, 0);
+    LLVMBuildStore(b, LLVMBuildOr(b,
+                       LLVMBuildAnd(b, old, mask, "pm"),
+                       cc, "pn"), v_psl);
+}
+
+/* ------------------------------------------------------------------ */
+/* Module helpers                                                       */
+/* ------------------------------------------------------------------ */
+
+static LLVMErrorRef jit_add_module(LLVMModuleRef mod)
+{
+    LLVMOrcThreadSafeModuleRef tsm =
+        LLVMOrcCreateNewThreadSafeModule(mod,
+            LLVMOrcCreateNewThreadSafeContext());
+    return LLVMOrcLLJITAddLLVMIRModule(jit,
+               LLVMOrcLLJITGetMainJITDylib(jit), tsm);
+}
+
+static void *jit_lookup(const char *name)
+{
+    LLVMOrcExecutorAddress addr = 0;
+    LLVMErrorRef err = LLVMOrcLLJITLookup(jit, &addr, name);
+    if (err) {
+        char *msg = LLVMGetErrorMessage(err);
+        fprintf(stderr, "vax_jit: lookup %s: %s\n", name, msg);
+        LLVMDisposeErrorMessage(msg);
+        return NULL;
+    }
+    return (void *)(uintptr_t)addr;
+}
+
+/* ------------------------------------------------------------------ */
+/* Compile: NOP                                                         */
+/* ------------------------------------------------------------------ */
+
+static int compile_nop(void)
+{
+    LLVMModuleRef  mod = LLVMModuleCreateWithNameInContext("m_nop", ctx);
+    LLVMValueRef   fn  = LLVMAddFunction(mod, "vax_nop",
+                             LLVMFunctionType(LLVMVoidTypeInContext(ctx),
+                                              NULL, 0, 0));
+    LLVMBuilderRef b   = LLVMCreateBuilderInContext(ctx);
+    LLVMPositionBuilderAtEnd(b,
+        LLVMAppendBasicBlockInContext(ctx, fn, "entry"));
+    LLVMBuildRetVoid(b);
+    LLVMDisposeBuilder(b);
+
+    LLVMErrorRef err = jit_add_module(mod);
+    if (err) { char *m = LLVMGetErrorMessage(err);
+               fprintf(stderr, "vax_jit: compile nop: %s\n", m);
+               LLVMDisposeErrorMessage(m); return 0; }
+    fn_nop = (NopFn)jit_lookup("vax_nop");
+    return fn_nop != NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Compile: integer longword 2-op (intl2 family)                       */
+/* void fn(ptr regs, ptr psl, i32 src_is_const, i32 src_val, i32 dst_reg) */
+/* ------------------------------------------------------------------ */
+
+static int compile_intl2(VaxIntOpL op, const char *sym)
+{
+    LLVMTypeRef i32     = LLVMInt32TypeInContext(ctx);
+    LLVMTypeRef ptr     = LLVMPointerTypeInContext(ctx, 0);
+    LLVMTypeRef ps[5]   = { ptr, ptr, i32, i32, i32 };
+    LLVMModuleRef mod   = LLVMModuleCreateWithNameInContext(sym, ctx);
+    LLVMValueRef  fn    = LLVMAddFunction(mod, sym,
+                              LLVMFunctionType(LLVMVoidTypeInContext(ctx),
+                                               ps, 5, 0));
+    LLVMBuilderRef b    = LLVMCreateBuilderInContext(ctx);
+    LLVMPositionBuilderAtEnd(b,
+        LLVMAppendBasicBlockInContext(ctx, fn, "entry"));
+
+    LLVMValueRef v_regs = LLVMGetParam(fn, 0);
+    LLVMValueRef v_psl  = LLVMGetParam(fn, 1);
+    LLVMValueRef v_sic  = LLVMGetParam(fn, 2);
+    LLVMValueRef v_sv   = LLVMGetParam(fn, 3);
+    LLVMValueRef v_dr   = LLVMGetParam(fn, 4);
+
+    LLVMValueRef src     = build_resolve(b, i32, v_regs, v_sic, v_sv);
+    LLVMValueRef dst_ptr = LLVMBuildGEP2(b, i32, v_regs, &v_dr, 1, "dp");
+    LLVMValueRef dst_old = LLVMBuildLoad2(b, i32, dst_ptr, "dv");
+
+    LLVMValueRef result, cc;
+    switch (op) {
+    case VAX_INTL_ADD:
+        result = LLVMBuildAdd(b, dst_old, src, "r");
+        cc     = build_cc_add(b, i32, src, dst_old, result);
+        break;
+    case VAX_INTL_SUB:
+        result = LLVMBuildSub(b, dst_old, src, "r");
+        cc     = build_cc_sub(b, i32, src, dst_old, result);
+        break;
+    case VAX_INTL_OR:
+        result = LLVMBuildOr(b, dst_old, src, "r");
+        cc     = build_cc_logical(b, i32, result);
+        break;
+    case VAX_INTL_AND_NOT: {
+        LLVMValueRef ns = LLVMBuildNot(b, src, "ns");
+        result = LLVMBuildAnd(b, dst_old, ns, "r");
+        cc     = build_cc_logical(b, i32, result);
+        break;
+    }
+    case VAX_INTL_XOR:
+        result = LLVMBuildXor(b, dst_old, src, "r");
+        cc     = build_cc_logical(b, i32, result);
+        break;
+    case VAX_INTL_MOV:
+        result = src;
+        cc     = build_cc_logical(b, i32, result);
+        break;
+    case VAX_INTL_COM:
+        result = LLVMBuildNot(b, src, "r");
+        cc     = build_cc_logical(b, i32, result);
+        break;
+    default:
+        LLVMDisposeBuilder(b);
+        LLVMDisposeModule(mod);
+        return 0;
+    }
+
+    LLVMBuildStore(b, result, dst_ptr);
+    build_psl_update(b, i32, v_psl, cc);
+    LLVMBuildRetVoid(b);
+    LLVMDisposeBuilder(b);
+
+    LLVMErrorRef err = jit_add_module(mod);
+    if (err) { char *m = LLVMGetErrorMessage(err);
+               fprintf(stderr, "vax_jit: compile %s: %s\n", sym, m);
+               LLVMDisposeErrorMessage(m); return 0; }
+    fn_intl2[op] = (IntL2Fn)jit_lookup(sym);
+    return fn_intl2[op] != NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Compile: CMPL  (src1 - src2, CC_SUB, no store)                      */
+/* void fn(ptr regs, ptr psl,                                           */
+/*         i32 s1_is_const, i32 s1_val, i32 s2_is_const, i32 s2_val)   */
+/* ------------------------------------------------------------------ */
+
+static int compile_cmpl(void)
+{
+    LLVMTypeRef i32   = LLVMInt32TypeInContext(ctx);
+    LLVMTypeRef ptr   = LLVMPointerTypeInContext(ctx, 0);
+    LLVMTypeRef ps[6] = { ptr, ptr, i32, i32, i32, i32 };
+    LLVMModuleRef mod = LLVMModuleCreateWithNameInContext("m_cmpl", ctx);
+    LLVMValueRef  fn  = LLVMAddFunction(mod, "vax_cmpl",
+                            LLVMFunctionType(LLVMVoidTypeInContext(ctx),
+                                             ps, 6, 0));
+    LLVMBuilderRef b  = LLVMCreateBuilderInContext(ctx);
+    LLVMPositionBuilderAtEnd(b,
+        LLVMAppendBasicBlockInContext(ctx, fn, "entry"));
+
+    LLVMValueRef v_regs = LLVMGetParam(fn, 0);
+    LLVMValueRef v_psl  = LLVMGetParam(fn, 1);
+
+    /* src1 is the minuend (subtracted FROM), src2 is the subtrahend */
+    LLVMValueRef src1 = build_resolve(b, i32, v_regs,
+                                       LLVMGetParam(fn, 2), LLVMGetParam(fn, 3));
+    LLVMValueRef src2 = build_resolve(b, i32, v_regs,
+                                       LLVMGetParam(fn, 4), LLVMGetParam(fn, 5));
+
+    LLVMValueRef result = LLVMBuildSub(b, src1, src2, "r");
+    /* CC_SUB: subtrahend=src2, minuend=src1, result=src1-src2 */
+    LLVMValueRef cc     = build_cc_sub(b, i32, src2, src1, result);
+    build_psl_update(b, i32, v_psl, cc);
+    LLVMBuildRetVoid(b);
+    LLVMDisposeBuilder(b);
+
+    LLVMErrorRef err = jit_add_module(mod);
+    if (err) { char *m = LLVMGetErrorMessage(err);
+               fprintf(stderr, "vax_jit: compile cmpl: %s\n", m);
+               LLVMDisposeErrorMessage(m); return 0; }
+    fn_cmpl = (CmpLFn)jit_lookup("vax_cmpl");
+    return fn_cmpl != NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Compile: TSTL  (test src, CC_LOGICAL, no store)                     */
+/* void fn(ptr regs, ptr psl, i32 src_is_const, i32 src_val)           */
+/* ------------------------------------------------------------------ */
+
+static int compile_tstl(void)
+{
+    LLVMTypeRef i32   = LLVMInt32TypeInContext(ctx);
+    LLVMTypeRef ptr   = LLVMPointerTypeInContext(ctx, 0);
+    LLVMTypeRef ps[4] = { ptr, ptr, i32, i32 };
+    LLVMModuleRef mod = LLVMModuleCreateWithNameInContext("m_tstl", ctx);
+    LLVMValueRef  fn  = LLVMAddFunction(mod, "vax_tstl",
+                            LLVMFunctionType(LLVMVoidTypeInContext(ctx),
+                                             ps, 4, 0));
+    LLVMBuilderRef b  = LLVMCreateBuilderInContext(ctx);
+    LLVMPositionBuilderAtEnd(b,
+        LLVMAppendBasicBlockInContext(ctx, fn, "entry"));
+
+    LLVMValueRef src = build_resolve(b, i32, LLVMGetParam(fn, 0),
+                                      LLVMGetParam(fn, 2), LLVMGetParam(fn, 3));
+    build_psl_update(b, i32, LLVMGetParam(fn, 1),
+                     build_cc_logical(b, i32, src));
+    LLVMBuildRetVoid(b);
+    LLVMDisposeBuilder(b);
+
+    LLVMErrorRef err = jit_add_module(mod);
+    if (err) { char *m = LLVMGetErrorMessage(err);
+               fprintf(stderr, "vax_jit: compile tstl: %s\n", m);
+               LLVMDisposeErrorMessage(m); return 0; }
+    fn_tstl = (TstLFn)jit_lookup("vax_tstl");
+    return fn_tstl != NULL;
+}
+
+/* ------------------------------------------------------------------ */
 /* Init / destroy                                                       */
 /* ------------------------------------------------------------------ */
 
 int vax_jit_llvm_init(void)
 {
-    LLVMErrorRef err;
-
     LLVMInitializeNativeTarget();
     LLVMInitializeNativeAsmPrinter();
     LLVMInstallFatalErrorHandler(llvm_fatal);
@@ -55,7 +406,7 @@ int vax_jit_llvm_init(void)
         return -1;
     }
 
-    err = LLVMOrcCreateLLJIT(&jit, NULL);
+    LLVMErrorRef err = LLVMOrcCreateLLJIT(&jit, NULL);
     if (err) {
         char *msg = LLVMGetErrorMessage(err);
         fprintf(stderr, "vax_jit: ORC init failed: %s\n", msg);
@@ -64,6 +415,17 @@ int vax_jit_llvm_init(void)
         ctx = NULL;
         return -1;
     }
+
+    if (!compile_nop())                              return 0;
+    if (!compile_intl2(VAX_INTL_ADD,     "vax_addl")) return 0;
+    if (!compile_intl2(VAX_INTL_SUB,     "vax_subl")) return 0;
+    if (!compile_intl2(VAX_INTL_OR,      "vax_orl"))  return 0;
+    if (!compile_intl2(VAX_INTL_AND_NOT, "vax_bicl")) return 0;
+    if (!compile_intl2(VAX_INTL_XOR,     "vax_xorl")) return 0;
+    if (!compile_intl2(VAX_INTL_MOV,     "vax_movl")) return 0;
+    if (!compile_intl2(VAX_INTL_COM,     "vax_coml")) return 0;
+    if (!compile_cmpl())                              return 0;
+    if (!compile_tstl())                              return 0;
 
     fprintf(stdout, "VAX JIT enabled (LLVM ORC v2)\n");
     return 0;
@@ -76,202 +438,45 @@ void vax_jit_llvm_destroy(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* NOP: emit void @vax_nop() { ret void }, compile, execute            */
+/* Public API                                                           */
 /* ------------------------------------------------------------------ */
-
-static int jit_nop(void)
-{
-    LLVMModuleRef              mod;
-    LLVMBuilderRef             builder;
-    LLVMTypeRef                fn_type;
-    LLVMValueRef               fn;
-    LLVMBasicBlockRef          entry_bb;
-    LLVMOrcThreadSafeModuleRef tsm;
-    LLVMOrcJITDylibRef         dylib;
-    LLVMErrorRef               err;
-    LLVMOrcExecutorAddress     addr = 0;
-    void                       (*fn_ptr)(void);
-
-    mod     = LLVMModuleCreateWithNameInContext("vax_nop_mod", ctx);
-    fn_type = LLVMFunctionType(LLVMVoidTypeInContext(ctx), NULL, 0, 0);
-    fn      = LLVMAddFunction(mod, "vax_nop", fn_type);
-    entry_bb = LLVMAppendBasicBlockInContext(ctx, fn, "entry");
-    builder = LLVMCreateBuilderInContext(ctx);
-    LLVMPositionBuilderAtEnd(builder, entry_bb);
-    LLVMBuildRetVoid(builder);
-    LLVMDisposeBuilder(builder);
-
-    tsm  = LLVMOrcCreateNewThreadSafeModule(
-               mod, LLVMOrcCreateNewThreadSafeContext());
-    dylib = LLVMOrcLLJITGetMainJITDylib(jit);
-    err   = LLVMOrcLLJITAddLLVMIRModule(jit, dylib, tsm);
-    if (err) {
-        char *msg = LLVMGetErrorMessage(err);
-        fprintf(stderr, "vax_jit NOP: add module failed: %s\n", msg);
-        LLVMDisposeErrorMessage(msg);
-        return 0;
-    }
-
-    err = LLVMOrcLLJITLookup(jit, &addr, "vax_nop");
-    if (err) {
-        char *msg = LLVMGetErrorMessage(err);
-        fprintf(stderr, "vax_jit NOP: lookup failed: %s\n", msg);
-        LLVMDisposeErrorMessage(msg);
-        return 0;
-    }
-
-    fn_ptr = (void (*)(void))(uintptr_t)addr;
-    fn_ptr();
-    fprintf(stdout, "vax_jit: executed NOP via JIT\n");
-    return 1;
-}
-
-/* ------------------------------------------------------------------ */
-/* ADDL2: R[dst] = R[dst] + R[src],  update PSL condition codes        */
-/*                                                                      */
-/* IR:  void @vax_addl2(ptr %regs, ptr %psl, i32 %src_idx, i32 %dst_idx) */
-/* CC (matches interpreter's CC_ADD_L macro):                           */
-/*   N = result[31]                                                     */
-/*   Z = result == 0                                                    */
-/*   V = (~src ^ dst) & (src ^ result) has bit 31 set                  */
-/*   C = (uint32)result < (uint32)dst_old                               */
-/* ------------------------------------------------------------------ */
-
-/* src_is_const: 0 = register operand (src_val is reg index),
-                 1 = constant operand (src_val is the literal/immediate value).
-   When src_is_const, the IR uses LLVMConstInt instead of GEP+load so LLVM
-   sees a compile-time constant and can fold it away in later optimisation. */
-static int jit_addl2(int32_t *regs, int32_t *psl,
-                     int src_is_const, int32_t src_val, int dst_reg)
-{
-    LLVMModuleRef              mod;
-    LLVMBuilderRef             builder;
-    LLVMTypeRef                fn_type;
-    LLVMValueRef               fn;
-    LLVMBasicBlockRef          entry_bb;
-    LLVMOrcThreadSafeModuleRef tsm;
-    LLVMOrcJITDylibRef         dylib;
-    LLVMErrorRef               err;
-    LLVMOrcExecutorAddress     addr = 0;
-    void                       (*fn_ptr)(int32_t *, int32_t *, int32_t);
-
-    LLVMTypeRef i32  = LLVMInt32TypeInContext(ctx);
-    LLVMTypeRef ptr  = LLVMPointerTypeInContext(ctx, 0);  /* opaque ptr */
-
-    /* Build: void @vax_addl2(ptr %regs, ptr %psl, i32 %dst_reg)
-       src is either a GEP+load (register) or a ConstInt (literal/immediate). */
-    LLVMTypeRef param_types[3] = { ptr, ptr, i32 };
-    mod     = LLVMModuleCreateWithNameInContext("vax_addl2_mod", ctx);
-    fn_type = LLVMFunctionType(LLVMVoidTypeInContext(ctx), param_types, 3, 0);
-    fn      = LLVMAddFunction(mod, "vax_addl2", fn_type);
-    entry_bb = LLVMAppendBasicBlockInContext(ctx, fn, "entry");
-    builder  = LLVMCreateBuilderInContext(ctx);
-    LLVMPositionBuilderAtEnd(builder, entry_bb);
-
-    LLVMValueRef v_regs    = LLVMGetParam(fn, 0);
-    LLVMValueRef v_psl     = LLVMGetParam(fn, 1);
-    LLVMValueRef v_dst_idx = LLVMGetParam(fn, 2);
-
-    /* src: constant fold if literal/immediate, otherwise load from regs[] */
-    LLVMValueRef src;
-    if (src_is_const) {
-        src = LLVMConstInt(i32, (unsigned)src_val, 1);   /* sign-extend */
-    } else {
-        LLVMValueRef sv  = LLVMConstInt(i32, (unsigned)src_val, 0);
-        LLVMValueRef sptr = LLVMBuildGEP2(builder, i32, v_regs, &sv, 1, "src_ptr");
-        src = LLVMBuildLoad2(builder, i32, sptr, "src");
-    }
-
-    /* dst_old = regs[dst_idx] */
-    LLVMValueRef dst_ptr = LLVMBuildGEP2(builder, i32, v_regs, &v_dst_idx, 1, "dst_ptr");
-    LLVMValueRef dst_old = LLVMBuildLoad2(builder, i32, dst_ptr, "dst_old");
-
-    /* result = src + dst_old */
-    LLVMValueRef result = LLVMBuildAdd(builder, src, dst_old, "result");
-    LLVMBuildStore(builder, result, dst_ptr);
-
-    /* --- condition codes --- */
-    LLVMValueRef zero    = LLVMConstInt(i32, 0, 0);
-    LLVMValueRef lsign   = LLVMConstInt(i32, 0x80000000u, 0);
-    LLVMValueRef cc_n_v  = LLVMConstInt(i32, 0x08, 0);   /* CC_N */
-    LLVMValueRef cc_z_v  = LLVMConstInt(i32, 0x04, 0);   /* CC_Z */
-    LLVMValueRef cc_ov_v = LLVMConstInt(i32, 0x02, 0);   /* CC_V */
-    LLVMValueRef cc_c_v  = LLVMConstInt(i32, 0x01, 0);   /* CC_C */
-
-    /* N: result[31] set */
-    LLVMValueRef n_cond = LLVMBuildICmp(builder, LLVMIntSLT, result, zero, "n_cond");
-    LLVMValueRef n_bit  = LLVMBuildSelect(builder, n_cond, cc_n_v, zero, "n_bit");
-
-    /* Z: result == 0 */
-    LLVMValueRef z_cond = LLVMBuildICmp(builder, LLVMIntEQ, result, zero, "z_cond");
-    LLVMValueRef z_bit  = LLVMBuildSelect(builder, z_cond, cc_z_v, zero, "z_bit");
-
-    /* V: (~src ^ dst_old) & (src ^ result) has bit 31 set */
-    LLVMValueRef not_src = LLVMBuildNot(builder, src, "not_src");
-    LLVMValueRef t1      = LLVMBuildXor(builder, not_src, dst_old, "t1");
-    LLVMValueRef t2      = LLVMBuildXor(builder, src, result, "t2");
-    LLVMValueRef t3      = LLVMBuildAnd(builder, t1, t2, "t3");
-    LLVMValueRef v_msb   = LLVMBuildAnd(builder, t3, lsign, "v_msb");
-    LLVMValueRef v_cond  = LLVMBuildICmp(builder, LLVMIntNE, v_msb, zero, "v_cond");
-    LLVMValueRef v_bit   = LLVMBuildSelect(builder, v_cond, cc_ov_v, zero, "v_bit");
-
-    /* C: (uint32)result < (uint32)dst_old */
-    LLVMValueRef c_cond = LLVMBuildICmp(builder, LLVMIntULT, result, dst_old, "c_cond");
-    LLVMValueRef c_bit  = LLVMBuildSelect(builder, c_cond, cc_c_v, zero, "c_bit");
-
-    /* cc = N | Z | V | C */
-    LLVMValueRef cc_nz  = LLVMBuildOr(builder, n_bit, z_bit, "cc_nz");
-    LLVMValueRef cc_nzv = LLVMBuildOr(builder, cc_nz, v_bit, "cc_nzv");
-    LLVMValueRef cc     = LLVMBuildOr(builder, cc_nzv, c_bit, "cc");
-
-    /* PSL = (PSL & ~0xF) | cc */
-    LLVMValueRef psl_old     = LLVMBuildLoad2(builder, i32, v_psl, "psl_old");
-    LLVMValueRef cc_mask_inv = LLVMConstInt(i32, 0xFFFFFFF0u, 0);
-    LLVMValueRef psl_no_cc   = LLVMBuildAnd(builder, psl_old, cc_mask_inv, "psl_no_cc");
-    LLVMValueRef psl_new     = LLVMBuildOr(builder, psl_no_cc, cc, "psl_new");
-    LLVMBuildStore(builder, psl_new, v_psl);
-
-    LLVMBuildRetVoid(builder);
-    LLVMDisposeBuilder(builder);
-
-    tsm   = LLVMOrcCreateNewThreadSafeModule(
-                mod, LLVMOrcCreateNewThreadSafeContext());
-    dylib = LLVMOrcLLJITGetMainJITDylib(jit);
-    err   = LLVMOrcLLJITAddLLVMIRModule(jit, dylib, tsm);
-    if (err) {
-        char *msg = LLVMGetErrorMessage(err);
-        fprintf(stderr, "vax_jit ADDL2: add module: %s\n", msg);
-        LLVMDisposeErrorMessage(msg);
-        return 0;
-    }
-    err = LLVMOrcLLJITLookup(jit, &addr, "vax_addl2");
-    if (err) {
-        char *msg = LLVMGetErrorMessage(err);
-        fprintf(stderr, "vax_jit ADDL2: lookup: %s\n", msg);
-        LLVMDisposeErrorMessage(msg);
-        return 0;
-    }
-
-    fn_ptr = (void (*)(int32_t *, int32_t *, int32_t))(uintptr_t)addr;
-    fn_ptr(regs, psl, (int32_t)dst_reg);
-    if (src_is_const)
-        fprintf(stdout, "vax_jit: executed ADDL2 #%d, R%d via JIT\n",
-                src_val, dst_reg);
-    else
-        fprintf(stdout, "vax_jit: executed ADDL2 R%d, R%d via JIT\n",
-                src_val, dst_reg);
-    return 1;
-}
-
-int vax_jit_llvm_addl2(int32_t *regs, int32_t *psl,
-                       int src_is_const, int32_t src_val, int dst_reg)
-{
-    if (!jit) return 0;
-    return jit_addl2(regs, psl, src_is_const, src_val, dst_reg);
-}
 
 int vax_jit_llvm_nop(void)
 {
-    if (!jit) return 0;
-    return jit_nop();
+    if (!fn_nop) return 0;
+    fn_nop();
+    return 1;
+}
+
+/* op: VaxIntOpL enum value
+   src_is_const/src_val: literal (is_const=1) or register index (is_const=0)
+   dst_reg: register index to read dst_old from and write result to */
+int vax_jit_llvm_intl2(int32_t *regs, int32_t *psl, int op,
+                        int src_is_const, int32_t src_val, int dst_reg)
+{
+    if (!jit || op < 0 || op >= VAX_INTL_NOPS || !fn_intl2[op]) return 0;
+    fn_intl2[op](regs, psl,
+                 (int32_t)src_is_const, src_val, (int32_t)dst_reg);
+    return 1;
+}
+
+/* CMPL src1, src2 — computes src1 - src2, sets CC_SUB, no store */
+int vax_jit_llvm_cmpl(int32_t *regs, int32_t *psl,
+                      int src1_is_const, int32_t src1_val,
+                      int src2_is_const, int32_t src2_val)
+{
+    if (!fn_cmpl) return 0;
+    fn_cmpl(regs, psl,
+            (int32_t)src1_is_const, src1_val,
+            (int32_t)src2_is_const, src2_val);
+    return 1;
+}
+
+/* TSTL src — sets CC_LOGICAL based on src, no store */
+int vax_jit_llvm_tstl(int32_t *regs, int32_t *psl,
+                      int src_is_const, int32_t src_val)
+{
+    if (!fn_tstl) return 0;
+    fn_tstl(regs, psl, (int32_t)src_is_const, src_val);
+    return 1;
 }
