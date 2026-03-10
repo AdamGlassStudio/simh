@@ -709,13 +709,29 @@ for ( ;; ) {
     numspec = drom[opc][0];                             /* get # specs */
 
     /* JIT Option A hook: attempt JIT before interpreter operand decode.
-       opnd[] is not yet populated — the JIT handles its own operand access
-       for the opcodes it supports.  If it returns 1 the instruction is done;
-       continue the main loop.  If it returns 0, fall through to the
-       interpreter as normal.                                           */
-    if (vax_jit_enabled &&
-        vax_jit_execute(opc, &cpu_state, opnd, 0))
-        continue;
+       Spec bytes are read here (get_istr is static to this file) and
+       passed to vax_jit_execute as raw specifier bytes.  If the JIT
+       returns 1 the instruction is fully handled — continue the loop.
+       If the JIT returns 0 (unsupported operand mode or opcode), restore
+       the prefetch state so the interpreter spec loop sees intact bytes. */
+    {
+        int jit_nspc = vax_jit_enabled ? vax_jit_nspecs(opc) : -1;
+        if (jit_nspc >= 0) {
+            int32 specs[2]    = {0, 0};
+            int32 sv_pc       = PC;
+            int32 sv_ibufl    = ibufl,  sv_ibufh = ibufh;
+            int32 sv_ibcnt    = ibcnt,  sv_ppc   = ppc;
+            int   i;
+            for (i = 0; i < jit_nspc && i < 2; i++)
+                specs[i] = get_istr(L_BYTE, acc);
+            if (vax_jit_execute(opc, &cpu_state, specs, jit_nspc))
+                continue;
+            /* JIT declined (unsupported mode) — restore prefetch state */
+            PC    = sv_pc;
+            ibufl = sv_ibufl; ibufh = sv_ibufh;
+            ibcnt = sv_ibcnt; ppc   = sv_ppc;
+        }
+    }
 
 #if !defined(FULL_VAX)
     if (((DR_GETIGRP(numspec) == DR_GETIGRP(IG_BSDFL)) && (!(cpu_instruction_set & VAX_DFLOAT))) ||

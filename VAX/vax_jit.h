@@ -20,19 +20,27 @@
 int  vax_jit_init    (void);
 void vax_jit_destroy (void);
 
+/* How many specifier bytes the JIT needs to read before calling vax_jit_execute.
+   Returns -1 if the opcode is not JIT-handled (skip the JIT entirely).
+   Returns  0 for zero-operand instructions (NOP).
+   Returns  N for N single-byte specifiers.
+   The caller (vax_cpu.c) reads exactly this many bytes from the instruction
+   stream and saves/restores the prefetch state on JIT miss.          */
+int  vax_jit_nspecs  (int32 opc);
+
 /* Attempt to JIT-execute one instruction.
-   opc   - VAX opcode (0x000–0x1FF)
+   opc   - VAX opcode
    state - pointer to live VAXCPUState
-   opnd  - decoded operand array (same layout as the interpreter's opnd[])
-   nopnd - number of valid entries in opnd[]
+   specs - specifier bytes already read from the instruction stream
+           (vax_jit_nspecs(opc) of them); NULL for zero-specifier instructions
+   nspecs - number of entries in specs[]
 
-   Returns 1 if the JIT handled the instruction (interpreter should skip it),
-   returns 0 if the JIT did not handle it (interpreter should proceed normally).
-
-   In the current implementation only NOP (opcode 0x01) is handled; all other
-   opcodes return 0 immediately.                                     */
+   Returns 1 if the JIT handled the instruction (caller should `continue`
+   the main dispatch loop — interpreter must NOT also run it).
+   Returns 0 if the JIT did not handle it (caller must restore the prefetch
+   state to undo any specifier bytes that were consumed).             */
 int  vax_jit_execute (int32 opc, VAXCPUState *state,
-                      int32 *opnd, int nopnd);
+                      int32 *specs, int nspecs);
 
 /* 1 when JIT is enabled (SET CPU JIT), 0 when disabled (SET CPU NOJIT). */
 extern int vax_jit_enabled;
