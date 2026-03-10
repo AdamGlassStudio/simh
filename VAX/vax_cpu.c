@@ -189,10 +189,9 @@
 
 #define UNIT_V_CONH     (UNIT_V_UF + 0)                 /* halt to console */
 #define UNIT_V_MSIZE    (UNIT_V_UF + 1)                 /* dummy */
-#define UNIT_V_JIT      (UNIT_V_UF + 2)                 /* JIT enabled */
+/* UNIT_V_JIT and UNIT_V_JITDUMP (UF+2, UF+3) defined in vax_jit.h */
 #define UNIT_CONH       (1u << UNIT_V_CONH)
 #define UNIT_MSIZE      (1u << UNIT_V_MSIZE)
-#define UNIT_JIT        (1u << UNIT_V_JIT)
 #define GET_CUR         acc = ACC_MASK (PSL_GETCUR (PSL))
 
 #define OPND_SIZE       16
@@ -294,6 +293,7 @@ t_stat cpu_set_hist (UNIT *uptr, int32 val, CONST char *cptr, void *desc);
 t_stat cpu_show_hist (FILE *st, UNIT *uptr, int32 val, CONST void *desc);
 t_stat cpu_show_virt (FILE *st, UNIT *uptr, int32 val, CONST void *desc);
 t_stat cpu_set_idle (UNIT *uptr, int32 val, CONST char *cptr, void *desc);
+t_stat cpu_set_jitdump (UNIT *uptr, int32 val, CONST char *cptr, void *desc);
 t_stat cpu_show_idle (FILE *st, UNIT *uptr, int32 val, CONST void *desc);
 t_stat cpu_set_instruction_set (UNIT *uptr, int32 val, CONST char *cptr, void *desc);
 t_stat cpu_show_instruction_set (FILE *st, UNIT *uptr, int32 val, CONST void *desc);
@@ -400,8 +400,10 @@ REG cpu_reg[] = {
 MTAB cpu_mod[] = {
     { UNIT_CONH, 0, "HALT to SIMH", "SIMHALT", NULL, NULL, NULL, "Set HALT to trap to simulator" },
     { UNIT_CONH, UNIT_CONH, "HALT to console", "CONHALT", NULL, NULL, NULL, "Set HALT to trap to console ROM" },
-    { UNIT_JIT, 0,        "JIT disabled", "NOJIT", NULL, NULL, NULL, "Disable JIT accelerator" },
-    { UNIT_JIT, UNIT_JIT, "JIT enabled",  "JIT",   NULL, NULL, NULL, "Enable JIT accelerator" },
+    { UNIT_JIT, 0,        "JIT disabled", "NOJIT",    NULL, NULL, NULL, "Disable JIT accelerator" },
+    { UNIT_JIT, UNIT_JIT, "JIT enabled",  "JIT",      NULL, NULL, NULL, "Enable JIT accelerator" },
+    { UNIT_JITDUMP, 0,           "JIT IR dump disabled", "NOJITDUMP", &cpu_set_jitdump, NULL, NULL, "Disable JIT IR dump" },
+    { UNIT_JITDUMP, UNIT_JITDUMP,"JIT IR dump enabled",  "JITDUMP",   &cpu_set_jitdump, NULL, NULL, "Dump LLVM IR for each compiled handler to stderr" },
     { MTAB_XTD|MTAB_VDV, 0, "IDLE", "IDLE{=VMS|ULTRIX|ULTRIX-1.X|ULTRIXOLD|NETBSD|NETBSDOLD|OPENBSD|OPENBSDOLD|QUASIJARUS|32V|ELN|MDM|INFOSERVER}{:n}", &cpu_set_idle, &cpu_show_idle, NULL, "Display idle detection mode" },
     { MTAB_XTD|MTAB_VDV, 0, NULL, "NOIDLE", &sim_clr_idle, NULL, NULL,  "Disables idle detection" },
     MEM_MODIFIERS,   /* Model specific memory modifiers from vaxXXX_defs.h */
@@ -475,7 +477,8 @@ int32 opnd[OPND_SIZE];                                  /* operand queue */
 
 if ((ret = build_dib_tab ()) != SCPE_OK)                /* build, chk dib_tab */
     return ret;
-vax_jit_enabled = (cpu_unit.flags & UNIT_JIT) ? 1 : 0; /* sync JIT flag */
+vax_jit_enabled  = (cpu_unit.flags & UNIT_JIT)     ? 1 : 0; /* sync JIT flag */
+vax_jit_ir_dump  = (cpu_unit.flags & UNIT_JITDUMP) ? 1 : 0; /* sync IR dump flag */
 if ((PSL & PSL_MBZ) ||                                  /* validate PSL<mbz> */
     ((PSL & PSL_CM) && BadCmPSL (PSL)) ||               /* validate PSL<cm> */
     ((PSL_GETCUR (PSL) != KERN) &&                      /* esu => is, ipl = 0 */
@@ -3800,6 +3803,26 @@ if (cptr != NULL) {
     return SCPE_ARG;
     }
 return sim_set_idle (uptr, val, cptr, desc);
+}
+
+/* SET CPU JITDUMP / SET CPU NOJITDUMP
+   Re-initialises the JIT so handlers are recompiled with the new dump
+   setting.  Safe to call any time — destroy is a no-op if not yet init'd. */
+t_stat cpu_set_jitdump (UNIT *uptr, int32 val, CONST char *cptr, void *desc)
+{
+/* SIMH does not auto-update uptr->flags for MTAB entries with a setfn,
+   so we must do it here before calling vax_jit_init(). */
+if (val & UNIT_JITDUMP)
+    uptr->flags |= UNIT_JITDUMP;
+else
+    uptr->flags &= ~UNIT_JITDUMP;
+vax_jit_ir_dump = (val & UNIT_JITDUMP) ? 1 : 0;
+if (M != NULL) {                        /* JIT already initialised */
+    vax_jit_destroy();
+    if (vax_jit_init() != 0)
+        return SCPE_IERR;
+    }
+return SCPE_OK;
 }
 
 t_stat cpu_show_idle (FILE *st, UNIT *uptr, int32 val, CONST void *desc)

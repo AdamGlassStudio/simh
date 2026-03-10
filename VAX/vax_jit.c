@@ -39,6 +39,7 @@ typedef enum {
 
 int  vax_jit_llvm_init    (void);
 void vax_jit_llvm_destroy (void);
+void vax_jit_llvm_set_ir_dump (int enable);
 int  vax_jit_llvm_nop     (void);
 int  vax_jit_llvm_intl2   (int32_t *regs, int32_t *psl, int op,
                             int src_is_const, int32_t src_val, int dst_reg);
@@ -49,8 +50,13 @@ int  vax_jit_llvm_tstl    (int32_t *regs, int32_t *psl,
                             int src_is_const, int32_t src_val);
 
 int vax_jit_enabled = 0;
+int vax_jit_ir_dump = 0;
 
-int vax_jit_init(void)    { return vax_jit_llvm_init(); }
+int vax_jit_init(void)
+{
+    vax_jit_llvm_set_ir_dump(vax_jit_ir_dump);
+    return vax_jit_llvm_init();
+}
 void vax_jit_destroy(void) { vax_jit_llvm_destroy(); }
 
 /* ------------------------------------------------------------------ */

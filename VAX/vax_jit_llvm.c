@@ -47,6 +47,7 @@ typedef enum {
 
 static LLVMOrcLLJITRef jit = NULL;
 static LLVMContextRef  ctx = NULL;
+static int             ir_dump = 0;   /* set by vax_jit_llvm_set_ir_dump() */
 
 static void llvm_fatal(const char *reason)
 {
@@ -191,6 +192,11 @@ static void build_psl_update(LLVMBuilderRef b, LLVMTypeRef i32,
 
 static LLVMErrorRef jit_add_module(LLVMModuleRef mod)
 {
+    if (ir_dump) {
+        char *ir = LLVMPrintModuleToString(mod);
+        fprintf(stderr, "%s\n", ir);
+        LLVMDisposeMessage(ir);
+    }
     LLVMOrcThreadSafeModuleRef tsm =
         LLVMOrcCreateNewThreadSafeModule(mod,
             LLVMOrcCreateNewThreadSafeContext());
@@ -479,4 +485,11 @@ int vax_jit_llvm_tstl(int32_t *regs, int32_t *psl,
     if (!fn_tstl) return 0;
     fn_tstl(regs, psl, (int32_t)src_is_const, src_val);
     return 1;
+}
+
+/* Enable/disable IR dump — call before init so handlers are dumped at
+   compile time (they are compiled once during vax_jit_llvm_init).     */
+void vax_jit_llvm_set_ir_dump(int enable)
+{
+    ir_dump = enable;
 }

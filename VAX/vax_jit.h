@@ -15,6 +15,16 @@
 #include "vax_defs.h"
 
 /* ------------------------------------------------------------------
+   SIMH unit flags for the JIT.  Defined here (rather than vax_cpu.c)
+   so that vax_jit.c can read them from cpu_unit.flags at init time.
+   Must not overlap with UNIT_V_UF+0 (CONH) or UNIT_V_UF+1 (MSIZE).
+   ------------------------------------------------------------------ */
+#define UNIT_V_JIT      (UNIT_V_UF + 2)    /* JIT enabled               */
+#define UNIT_V_JITDUMP  (UNIT_V_UF + 3)    /* dump LLVM IR to stderr    */
+#define UNIT_JIT        (1u << UNIT_V_JIT)
+#define UNIT_JITDUMP    (1u << UNIT_V_JITDUMP)
+
+/* ------------------------------------------------------------------
    VAX specifier mode nibble constants (high nibble of each spec byte).
    The full VAX Architecture Reference Manual defines these (ch. 3).
    ------------------------------------------------------------------ */
@@ -88,5 +98,9 @@ void vax_jit_destroy (void);
 
 /* 1 when JIT is enabled (SET CPU JIT), 0 when disabled (SET CPU NOJIT). */
 extern int vax_jit_enabled;
+
+/* 1 when IR dump is enabled (SET CPU JITDUMP) — prints LLVM IR for each
+   compiled handler to stderr.  Useful for inspecting generated code.    */
+extern int vax_jit_ir_dump;
 
 #endif /* VAX_JIT_H */
