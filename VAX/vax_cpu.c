@@ -185,11 +185,14 @@
 /* Definitions */
 
 #include "vax_defs.h"
+#include "vax_jit.h"
 
 #define UNIT_V_CONH     (UNIT_V_UF + 0)                 /* halt to console */
 #define UNIT_V_MSIZE    (UNIT_V_UF + 1)                 /* dummy */
+#define UNIT_V_JIT      (UNIT_V_UF + 2)                 /* JIT enabled */
 #define UNIT_CONH       (1u << UNIT_V_CONH)
 #define UNIT_MSIZE      (1u << UNIT_V_MSIZE)
+#define UNIT_JIT        (1u << UNIT_V_JIT)
 #define GET_CUR         acc = ACC_MASK (PSL_GETCUR (PSL))
 
 #define OPND_SIZE       16
@@ -397,6 +400,8 @@ REG cpu_reg[] = {
 MTAB cpu_mod[] = {
     { UNIT_CONH, 0, "HALT to SIMH", "SIMHALT", NULL, NULL, NULL, "Set HALT to trap to simulator" },
     { UNIT_CONH, UNIT_CONH, "HALT to console", "CONHALT", NULL, NULL, NULL, "Set HALT to trap to console ROM" },
+    { UNIT_JIT, 0,        "JIT disabled", "NOJIT", NULL, NULL, NULL, "Disable JIT accelerator" },
+    { UNIT_JIT, UNIT_JIT, "JIT enabled",  "JIT",   NULL, NULL, NULL, "Enable JIT accelerator" },
     { MTAB_XTD|MTAB_VDV, 0, "IDLE", "IDLE{=VMS|ULTRIX|ULTRIX-1.X|ULTRIXOLD|NETBSD|NETBSDOLD|OPENBSD|OPENBSDOLD|QUASIJARUS|32V|ELN|MDM|INFOSERVER}{:n}", &cpu_set_idle, &cpu_show_idle, NULL, "Display idle detection mode" },
     { MTAB_XTD|MTAB_VDV, 0, NULL, "NOIDLE", &sim_clr_idle, NULL, NULL,  "Disables idle detection" },
     MEM_MODIFIERS,   /* Model specific memory modifiers from vaxXXX_defs.h */
@@ -470,6 +475,7 @@ int32 opnd[OPND_SIZE];                                  /* operand queue */
 
 if ((ret = build_dib_tab ()) != SCPE_OK)                /* build, chk dib_tab */
     return ret;
+vax_jit_enabled = (cpu_unit.flags & UNIT_JIT) ? 1 : 0; /* sync JIT flag */
 if ((PSL & PSL_MBZ) ||                                  /* validate PSL<mbz> */
     ((PSL & PSL_CM) && BadCmPSL (PSL)) ||               /* validate PSL<cm> */
     ((PSL_GETCUR (PSL) != KERN) &&                      /* esu => is, ipl = 0 */
@@ -701,6 +707,16 @@ for ( ;; ) {
         opc = opc | 0x100;                              /* flag */
         }
     numspec = drom[opc][0];                             /* get # specs */
+
+    /* JIT Option A hook: attempt JIT before interpreter operand decode.
+       opnd[] is not yet populated — the JIT handles its own operand access
+       for the opcodes it supports.  If it returns 1 the instruction is done;
+       continue the main loop.  If it returns 0, fall through to the
+       interpreter as normal.                                           */
+    if (vax_jit_enabled &&
+        vax_jit_execute(opc, &cpu_state, opnd, 0))
+        continue;
+
 #if !defined(FULL_VAX)
     if (((DR_GETIGRP(numspec) == DR_GETIGRP(IG_BSDFL)) && (!(cpu_instruction_set & VAX_DFLOAT))) ||
         ((DR_GETIGRP(numspec) == DR_GETIGRP(IG_BSGFL)) && (!(cpu_instruction_set & VAX_GFLOAT))) ||
@@ -3322,6 +3338,8 @@ if (M == NULL) {                        /* first time init? */
     if (M == NULL)
         return SCPE_MEM;
     auto_config(NULL, 0);               /* do an initial auto configure */
+    if (vax_jit_init() != 0)
+        return SCPE_IERR;
     }
 return build_dib_tab ();
 }
