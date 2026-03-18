@@ -90,61 +90,140 @@ void vax_jit_decode_operand(int32 spec, int32 follow, int32 pc_after,
 {
     int mode = VAX_SPEC_MODE(spec);
     int reg  = VAX_SPEC_REG(spec);
-    op->reg = 0; op->imm = 0;
+    int32 disp8, disp16;
 
+    op->kind = JITOPK_UNSUPPORTED;
+    op->reg  = 0;
+    op->imm  = 0;
+
+    /* Short literal: value 0-63 encoded in the specifier byte itself */
     if (VAX_SPEC_IS_SHORT_LIT(spec)) {
-        op->kind = JITOPK_LITERAL; op->imm = spec & 0x3F; return;
-    }
+        op->kind = JITOPK_LITERAL;
+        op->imm  = spec & 0x3F;
+        return;
+        }
+
     switch (mode) {
+
     case VAX_SPEC_REGISTER:
-        op->kind = JITOPK_REGISTER; op->reg = reg; return;
+        op->kind = JITOPK_REGISTER;
+        op->reg  = reg;
+        break;
+
     case VAX_SPEC_REG_DEFERRED:
-        op->kind = JITOPK_REG_DEFERRED; op->reg = reg; return;
+        op->kind = JITOPK_REG_DEFERRED;
+        op->reg  = reg;
+        break;
+
     case VAX_SPEC_AUTODECREMENT:
-        op->kind = JITOPK_AUTODECREMENT; op->reg = reg; return;
+        op->kind = JITOPK_AUTODECREMENT;
+        op->reg  = reg;
+        break;
+
     case VAX_SPEC_AUTOINCREMENT:
-        if (reg == nPC) { op->kind = JITOPK_IMMEDIATE; op->imm = follow; }
-        else            { op->kind = JITOPK_AUTOINCREMENT; op->reg = reg; }
-        return;
+        /* PC case: immediate (#imm) — follow holds the inline value */
+        if (reg == nPC) {
+            op->kind = JITOPK_IMMEDIATE;
+            op->imm  = follow;
+            }
+        else {
+            op->kind = JITOPK_AUTOINCREMENT;
+            op->reg  = reg;
+            }
+        break;
+
     case VAX_SPEC_AUTOINC_DEF:
-        if (reg == nPC) { op->kind = JITOPK_ABSOLUTE; op->imm = follow; }
-        else            { op->kind = JITOPK_AUTOINC_DEF; op->reg = reg; }
-        return;
+        /* PC case: absolute (@#addr) — follow holds the target address */
+        if (reg == nPC) {
+            op->kind = JITOPK_ABSOLUTE;
+            op->imm  = follow;
+            }
+        else {
+            op->kind = JITOPK_AUTOINC_DEF;
+            op->reg  = reg;
+            }
+        break;
+
     case VAX_SPEC_BYTE_DISP:
-        if (reg == nPC) { op->kind = JITOPK_ABSOLUTE;
-                          op->imm  = pc_after + (int32)(int8_t)(follow & 0xFF); }
-        else            { op->kind = JITOPK_DISP; op->reg = reg;
-                          op->imm  = (int32)(int8_t)(follow & 0xFF); }
-        return;
+        disp8 = (int32)(int8_t)(follow & 0xFF);
+        if (reg == nPC) {
+            op->kind = JITOPK_ABSOLUTE;         /* PC-relative → fold EA */
+            op->imm  = pc_after + disp8;
+            }
+        else {
+            op->kind = JITOPK_DISP;
+            op->reg  = reg;
+            op->imm  = disp8;
+            }
+        break;
+
     case VAX_SPEC_BYTE_DISP_DEF:
-        if (reg == nPC) { op->kind = JITOPK_ABS_DEFERRED;
-                          op->imm  = pc_after + (int32)(int8_t)(follow & 0xFF); }
-        else            { op->kind = JITOPK_DISP_DEFERRED; op->reg = reg;
-                          op->imm  = (int32)(int8_t)(follow & 0xFF); }
-        return;
+        disp8 = (int32)(int8_t)(follow & 0xFF);
+        if (reg == nPC) {
+            op->kind = JITOPK_ABS_DEFERRED;
+            op->imm  = pc_after + disp8;
+            }
+        else {
+            op->kind = JITOPK_DISP_DEFERRED;
+            op->reg  = reg;
+            op->imm  = disp8;
+            }
+        break;
+
     case VAX_SPEC_WORD_DISP:
-        if (reg == nPC) { op->kind = JITOPK_ABSOLUTE;
-                          op->imm  = pc_after + (int32)(int16_t)(follow & 0xFFFF); }
-        else            { op->kind = JITOPK_DISP; op->reg = reg;
-                          op->imm  = (int32)(int16_t)(follow & 0xFFFF); }
-        return;
+        disp16 = (int32)(int16_t)(follow & 0xFFFF);
+        if (reg == nPC) {
+            op->kind = JITOPK_ABSOLUTE;
+            op->imm  = pc_after + disp16;
+            }
+        else {
+            op->kind = JITOPK_DISP;
+            op->reg  = reg;
+            op->imm  = disp16;
+            }
+        break;
+
     case VAX_SPEC_WORD_DISP_DEF:
-        if (reg == nPC) { op->kind = JITOPK_ABS_DEFERRED;
-                          op->imm  = pc_after + (int32)(int16_t)(follow & 0xFFFF); }
-        else            { op->kind = JITOPK_DISP_DEFERRED; op->reg = reg;
-                          op->imm  = (int32)(int16_t)(follow & 0xFFFF); }
-        return;
+        disp16 = (int32)(int16_t)(follow & 0xFFFF);
+        if (reg == nPC) {
+            op->kind = JITOPK_ABS_DEFERRED;
+            op->imm  = pc_after + disp16;
+            }
+        else {
+            op->kind = JITOPK_DISP_DEFERRED;
+            op->reg  = reg;
+            op->imm  = disp16;
+            }
+        break;
+
     case VAX_SPEC_LONG_DISP:
-        if (reg == nPC) { op->kind = JITOPK_ABSOLUTE; op->imm = pc_after + follow; }
-        else            { op->kind = JITOPK_DISP; op->reg = reg; op->imm = follow; }
-        return;
+        if (reg == nPC) {
+            op->kind = JITOPK_ABSOLUTE;
+            op->imm  = pc_after + follow;
+            }
+        else {
+            op->kind = JITOPK_DISP;
+            op->reg  = reg;
+            op->imm  = follow;
+            }
+        break;
+
     case VAX_SPEC_LONG_DISP_DEF:
-        if (reg == nPC) { op->kind = JITOPK_ABS_DEFERRED; op->imm = pc_after + follow; }
-        else            { op->kind = JITOPK_DISP_DEFERRED; op->reg = reg; op->imm = follow; }
-        return;
+        if (reg == nPC) {
+            op->kind = JITOPK_ABS_DEFERRED;
+            op->imm  = pc_after + follow;
+            }
+        else {
+            op->kind = JITOPK_DISP_DEFERRED;
+            op->reg  = reg;
+            op->imm  = follow;
+            }
+        break;
+
     default:
-        op->kind = JITOPK_UNSUPPORTED; return;
-    }
+        op->kind = JITOPK_UNSUPPORTED;
+        break;
+        }
 }
 
 /* ------------------------------------------------------------------ */
