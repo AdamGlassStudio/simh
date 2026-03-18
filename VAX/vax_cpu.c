@@ -728,11 +728,15 @@ for ( ;; ) {
             int32 sv_ibcnt = ibcnt,  sv_ppc   = ppc;
             int   i;
             for (i = 0; i < jit_nops; i++) {
-                int32 spec   = get_istr(L_BYTE, acc);
-                int32 follow = 0;
-                if (vax_jit_operand_needs_long(spec))
-                    follow = get_istr(DR_LNT(drom[opc][i + 1]), acc);
-                vax_jit_decode_operand(spec, follow, &ops[i]);
+                int32 spec    = get_istr(L_BYTE, acc);
+                int32 follow  = 0;
+                int   ext_lnt = vax_jit_spec_ext_lnt(spec, DR_LNT(drom[opc][i + 1]));
+                if (ext_lnt > 0)
+                    follow = get_istr(ext_lnt, acc);
+                {
+                int32 pc_after = PC;
+                vax_jit_decode_operand(spec, follow, pc_after, &ops[i]);
+                }
             }
             if (vax_jit_execute(opc, &cpu_state, ops, jit_nops))
                 continue;

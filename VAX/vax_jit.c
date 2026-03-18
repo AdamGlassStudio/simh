@@ -48,6 +48,8 @@ int  vax_jit_llvm_cmpl    (int32_t *regs, int32_t *psl,
                             int src2_is_const, int32_t src2_val);
 int  vax_jit_llvm_tstl    (int32_t *regs, int32_t *psl,
                             int src_is_const, int32_t src_val);
+int  vax_jit_llvm_exec_block (VaxJITBlock *blk, int32_t *regs,
+                               int32_t *psl, int32_t *mem);
 
 int vax_jit_enabled = 0;
 int vax_jit_ir_dump = 0;
@@ -60,33 +62,89 @@ int vax_jit_init(void)
 void vax_jit_destroy(void) { vax_jit_llvm_destroy(); }
 
 /* ------------------------------------------------------------------ */
-/* Operand decode                                                       */
+/* Extension byte count                                                */
 /* ------------------------------------------------------------------ */
 
-void vax_jit_decode_operand(int32 spec, int32 follow, VaxJITOperand *op)
+int vax_jit_spec_ext_lnt(int32 spec, int32 op_lnt)
 {
-    if (VAX_SPEC_IS_SHORT_LIT(spec)) {
-        op->kind = JITOPK_LITERAL;
-        op->reg  = 0;
-        op->imm  = spec & 0x3F;
-    } else if (VAX_SPEC_MODE(spec) == VAX_SPEC_REGISTER) {
-        op->kind = JITOPK_REGISTER;
-        op->reg  = VAX_SPEC_REG(spec);
-        op->imm  = 0;
-    } else if (VAX_SPEC_IS_IMMEDIATE(spec)) {
-        op->kind = JITOPK_IMMEDIATE;
-        op->reg  = 0;
-        op->imm  = follow;
-    } else {
-        op->kind = JITOPK_UNSUPPORTED;
-        op->reg  = 0;
-        op->imm  = 0;
+    int mode = VAX_SPEC_MODE(spec);
+    int reg  = VAX_SPEC_REG(spec);
+    if (mode <= VAX_SPEC_AUTOINCREMENT) {
+        return (mode == VAX_SPEC_AUTOINCREMENT && reg == nPC) ? op_lnt : 0;
+    }
+    if (mode == VAX_SPEC_AUTOINC_DEF)
+        return (reg == nPC) ? 4 : 0;
+    /* modes A-F: byte/word/long displacement */
+    {
+        static const int lnt[6] = {1, 1, 2, 2, 4, 4};
+        return lnt[mode - VAX_SPEC_BYTE_DISP];
     }
 }
 
-int vax_jit_operand_needs_long(int32 spec)
+/* ------------------------------------------------------------------ */
+/* Operand decode                                                       */
+/* ------------------------------------------------------------------ */
+
+void vax_jit_decode_operand(int32 spec, int32 follow, int32 pc_after,
+                             VaxJITOperand *op)
 {
-    return VAX_SPEC_IS_IMMEDIATE(spec);
+    int mode = VAX_SPEC_MODE(spec);
+    int reg  = VAX_SPEC_REG(spec);
+    op->reg = 0; op->imm = 0;
+
+    if (VAX_SPEC_IS_SHORT_LIT(spec)) {
+        op->kind = JITOPK_LITERAL; op->imm = spec & 0x3F; return;
+    }
+    switch (mode) {
+    case VAX_SPEC_REGISTER:
+        op->kind = JITOPK_REGISTER; op->reg = reg; return;
+    case VAX_SPEC_REG_DEFERRED:
+        op->kind = JITOPK_REG_DEFERRED; op->reg = reg; return;
+    case VAX_SPEC_AUTODECREMENT:
+        op->kind = JITOPK_AUTODECREMENT; op->reg = reg; return;
+    case VAX_SPEC_AUTOINCREMENT:
+        if (reg == nPC) { op->kind = JITOPK_IMMEDIATE; op->imm = follow; }
+        else            { op->kind = JITOPK_AUTOINCREMENT; op->reg = reg; }
+        return;
+    case VAX_SPEC_AUTOINC_DEF:
+        if (reg == nPC) { op->kind = JITOPK_ABSOLUTE; op->imm = follow; }
+        else            { op->kind = JITOPK_AUTOINC_DEF; op->reg = reg; }
+        return;
+    case VAX_SPEC_BYTE_DISP:
+        if (reg == nPC) { op->kind = JITOPK_ABSOLUTE;
+                          op->imm  = pc_after + (int32)(int8_t)(follow & 0xFF); }
+        else            { op->kind = JITOPK_DISP; op->reg = reg;
+                          op->imm  = (int32)(int8_t)(follow & 0xFF); }
+        return;
+    case VAX_SPEC_BYTE_DISP_DEF:
+        if (reg == nPC) { op->kind = JITOPK_ABS_DEFERRED;
+                          op->imm  = pc_after + (int32)(int8_t)(follow & 0xFF); }
+        else            { op->kind = JITOPK_DISP_DEFERRED; op->reg = reg;
+                          op->imm  = (int32)(int8_t)(follow & 0xFF); }
+        return;
+    case VAX_SPEC_WORD_DISP:
+        if (reg == nPC) { op->kind = JITOPK_ABSOLUTE;
+                          op->imm  = pc_after + (int32)(int16_t)(follow & 0xFFFF); }
+        else            { op->kind = JITOPK_DISP; op->reg = reg;
+                          op->imm  = (int32)(int16_t)(follow & 0xFFFF); }
+        return;
+    case VAX_SPEC_WORD_DISP_DEF:
+        if (reg == nPC) { op->kind = JITOPK_ABS_DEFERRED;
+                          op->imm  = pc_after + (int32)(int16_t)(follow & 0xFFFF); }
+        else            { op->kind = JITOPK_DISP_DEFERRED; op->reg = reg;
+                          op->imm  = (int32)(int16_t)(follow & 0xFFFF); }
+        return;
+    case VAX_SPEC_LONG_DISP:
+        if (reg == nPC) { op->kind = JITOPK_ABSOLUTE; op->imm = pc_after + follow; }
+        else            { op->kind = JITOPK_DISP; op->reg = reg; op->imm = follow; }
+        return;
+    case VAX_SPEC_LONG_DISP_DEF:
+        if (reg == nPC) { op->kind = JITOPK_ABS_DEFERRED; op->imm = pc_after + follow; }
+        else            { op->kind = JITOPK_DISP_DEFERRED; op->reg = reg; op->imm = follow; }
+        return;
+    default:
+        op->kind = JITOPK_UNSUPPORTED; return;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -95,21 +153,51 @@ int vax_jit_operand_needs_long(int32 spec)
 
 static int op_is_readable(const VaxJITOperand *op)
 {
-    return op->kind == JITOPK_REGISTER
-        || op->kind == JITOPK_LITERAL
-        || op->kind == JITOPK_IMMEDIATE;
+    return op->kind != JITOPK_UNSUPPORTED;
 }
 
-/* Destination must be a register and not PC (computed branch → interpreter) */
 static int op_is_writable(const VaxJITOperand *op)
 {
-    return op->kind == JITOPK_REGISTER && op->reg != nPC;
+    /* literals/immediates can't be write targets */
+    if (op->kind == JITOPK_LITERAL || op->kind == JITOPK_IMMEDIATE)
+        return 0;
+    /* PC writes mean computed branch - hand to interpreter */
+    if (op->kind == JITOPK_REGISTER && op->reg == nPC)
+        return 0;
+    return op->kind != JITOPK_UNSUPPORTED;
 }
 
-/* Extract (is_const, val) pair from a decoded readable operand */
+static int op_is_mem(const VaxJITOperand *op)
+{
+    return op->kind >= JITOPK_REG_DEFERRED;
+}
+
+/* Extract (is_const, val) pair from a decoded readable operand.
+   Used by the fast-path handlers (register/literal/immediate only). */
 #define OP_SRC(op)  ((op)->kind != JITOPK_REGISTER), \
                     ((op)->kind == JITOPK_REGISTER ? (int32_t)(op)->reg \
                                                    : (int32_t)(op)->imm)
+
+/* ------------------------------------------------------------------ */
+/* Block path helpers                                                   */
+/* ------------------------------------------------------------------ */
+
+static VaxJITBlkOp to_blk_op(const VaxJITOperand *op)
+{
+    VaxJITBlkOp b;
+    b.kind = (VaxJITBlkOpKind)op->kind;  /* enums are layout-compatible */
+    b.reg  = op->reg;
+    b.imm  = (int32_t)op->imm;
+    return b;
+}
+
+static int needs_block_path(VaxJITOperand *ops, int nops)
+{
+    int i;
+    for (i = 0; i < nops; i++)
+        if (op_is_mem(&ops[i])) return 1;
+    return 0;
+}
 
 /* ------------------------------------------------------------------ */
 /* Instruction operand count (returns -1 if not JIT-handled)          */
@@ -138,16 +226,28 @@ int vax_jit_execute(int32 opc, VAXCPUState *state,
 {
     int32_t *regs = state->R;
     int32_t *psl  = &state->PSL;
+    int i;
 
     if (!vax_jit_enabled)
         return 0;
 
+    /* --- Block path: any memory-mode operand ------------------------ */
+    if (needs_block_path(ops, nops)) {
+        VaxJITBlock blk;
+        blk.opc   = opc;
+        blk.n_ops = nops;
+        for (i = 0; i < nops; i++)
+            blk.ops[i] = to_blk_op(&ops[i]);
+        return vax_jit_llvm_exec_block(&blk, regs, psl, (int32_t*)M);
+    }
+
+    /* --- Fast path: register/literal/immediate operands only -------- */
     switch (opc) {
 
     case NOP:
         return vax_jit_llvm_nop();
 
-    /* --- Two-operand: src (RL), dst (ML) — result written to dst --- */
+    /* --- Two-operand: src (RL), dst (ML) - result written to dst --- */
     case ADDL2: case SUBL2:
     case BISL2: case BICL2: case XORL2:
     case MOVL:  case MCOML: {
@@ -178,6 +278,9 @@ int vax_jit_execute(int32 opc, VAXCPUState *state,
         const VaxJITOperand *dst = &ops[1];
         if (!op_is_readable(src) || !op_is_writable(dst))
             return 0;
+        /* Fast path: dst must be a register (memory handled by block path above) */
+        if (dst->kind != JITOPK_REGISTER)
+            return 0;
         return vax_jit_llvm_intl2(regs, psl, intl_op, OP_SRC(src), dst->reg);
     }
 
@@ -203,6 +306,8 @@ int vax_jit_execute(int32 opc, VAXCPUState *state,
         const VaxJITOperand *dst = &ops[0];
         if (!op_is_writable(dst))
             return 0;
+        if (dst->kind != JITOPK_REGISTER)
+            return 0;
         return vax_jit_llvm_intl2(regs, psl, VAX_INTL_MOV,
                                    1, 0,        /* src = const 0 */
                                    dst->reg);
@@ -213,6 +318,8 @@ int vax_jit_execute(int32 opc, VAXCPUState *state,
         const VaxJITOperand *dst = &ops[0];
         if (!op_is_writable(dst))
             return 0;
+        if (dst->kind != JITOPK_REGISTER)
+            return 0;
         return vax_jit_llvm_intl2(regs, psl, VAX_INTL_ADD,
                                    1, 1,        /* src = const 1 */
                                    dst->reg);
@@ -222,6 +329,8 @@ int vax_jit_execute(int32 opc, VAXCPUState *state,
     case DECL: {
         const VaxJITOperand *dst = &ops[0];
         if (!op_is_writable(dst))
+            return 0;
+        if (dst->kind != JITOPK_REGISTER)
             return 0;
         return vax_jit_llvm_intl2(regs, psl, VAX_INTL_SUB,
                                    1, 1,        /* src = const 1 */

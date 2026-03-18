@@ -24,6 +24,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "vax_jit_block.h"
 
 /* ------------------------------------------------------------------ */
 /* Integer ALU operation kinds                                          */
@@ -394,6 +395,365 @@ static int compile_tstl(void)
                LLVMDisposeErrorMessage(m); return 0; }
     fn_tstl = (TstLFn)jit_lookup("vax_tstl");
     return fn_tstl != NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* VAX opcode values (numeric) - no SIMH include needed               */
+/* ------------------------------------------------------------------ */
+
+#define VAX_OPC_NOP   0x01
+#define VAX_OPC_ADDL2 0xC0
+#define VAX_OPC_SUBL2 0xC2
+#define VAX_OPC_BISL2 0xC8
+#define VAX_OPC_BICL2 0xCA
+#define VAX_OPC_XORL2 0xCC
+#define VAX_OPC_MOVL  0xD0
+#define VAX_OPC_CMPL  0xD1
+#define VAX_OPC_MCOML 0xD2
+#define VAX_OPC_CLRL  0xD4
+#define VAX_OPC_TSTL  0xD5
+#define VAX_OPC_INCL  0xD6
+#define VAX_OPC_DECL  0xD7
+
+/* ------------------------------------------------------------------ */
+/* Register shadow: tracks loaded/modified register values             */
+/* NULL = not yet loaded; non-NULL = loaded (and possibly modified).   */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    LLVMValueRef val[16];
+} RegShadow;
+
+static LLVMValueRef shadow_get(LLVMBuilderRef b, LLVMTypeRef i32,
+                                RegShadow *s, int reg, LLVMValueRef regs)
+{
+    if (!s->val[reg]) {
+        LLVMValueRef idx = LLVMConstInt(i32, (unsigned)reg, 0);
+        LLVMValueRef ptr = LLVMBuildGEP2(b, i32, regs, &idx, 1, "");
+        s->val[reg] = LLVMBuildLoad2(b, i32, ptr, "");
+    }
+    return s->val[reg];
+}
+
+static void shadow_set(RegShadow *s, int reg, LLVMValueRef val)
+{
+    s->val[reg] = val;
+}
+
+static void shadow_spill(LLVMBuilderRef b, LLVMTypeRef i32,
+                          RegShadow *s, LLVMValueRef regs)
+{
+    int i;
+    for (i = 0; i < 16; i++) {
+        if (!s->val[i]) continue;
+        LLVMValueRef idx = LLVMConstInt(i32, (unsigned)i, 0);
+        LLVMValueRef ptr = LLVMBuildGEP2(b, i32, regs, &idx, 1, "");
+        LLVMBuildStore(b, s->val[i], ptr);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Memory access helpers (VAX byte address -> M[addr>>2])              */
+/* ------------------------------------------------------------------ */
+
+static LLVMValueRef emit_mem_load(LLVMBuilderRef b, LLVMTypeRef i32,
+                                   LLVMValueRef mem, LLVMValueRef byte_addr)
+{
+    LLVMValueRef widx = LLVMBuildLShr(b, byte_addr, LLVMConstInt(i32, 2, 0), "wi");
+    LLVMValueRef ptr  = LLVMBuildGEP2(b, i32, mem, &widx, 1, "mp");
+    return LLVMBuildLoad2(b, i32, ptr, "mv");
+}
+
+static void emit_mem_store(LLVMBuilderRef b, LLVMTypeRef i32,
+                            LLVMValueRef mem, LLVMValueRef byte_addr,
+                            LLVMValueRef val)
+{
+    LLVMValueRef widx = LLVMBuildLShr(b, byte_addr, LLVMConstInt(i32, 2, 0), "wi");
+    LLVMValueRef ptr  = LLVMBuildGEP2(b, i32, mem, &widx, 1, "mp");
+    LLVMBuildStore(b, val, ptr);
+}
+
+/* Compute effective byte address for a memory operand.
+   For autodec/autoinc, also updates the register shadow.
+   Returns NULL for non-memory operand kinds.                          */
+static LLVMValueRef emit_operand_ea(LLVMBuilderRef b, LLVMTypeRef i32,
+                                     VaxJITBlkOp *op, RegShadow *s,
+                                     LLVMValueRef regs, LLVMValueRef mem)
+{
+    LLVMValueRef base, disp, ea;
+    switch (op->kind) {
+    case JITBLK_REG_DEFERRED:
+        return shadow_get(b, i32, s, op->reg, regs);
+    case JITBLK_AUTODECREMENT:
+        base = shadow_get(b, i32, s, op->reg, regs);
+        ea   = LLVMBuildSub(b, base, LLVMConstInt(i32, 4, 0), "ad");
+        shadow_set(s, op->reg, ea);
+        return ea;
+    case JITBLK_AUTOINCREMENT:
+        base = shadow_get(b, i32, s, op->reg, regs);
+        shadow_set(s, op->reg,
+                   LLVMBuildAdd(b, base, LLVMConstInt(i32, 4, 0), "ai"));
+        return base;
+    case JITBLK_AUTOINC_DEF:
+        base = shadow_get(b, i32, s, op->reg, regs);
+        shadow_set(s, op->reg,
+                   LLVMBuildAdd(b, base, LLVMConstInt(i32, 4, 0), "ai"));
+        return emit_mem_load(b, i32, mem, base);
+    case JITBLK_ABSOLUTE:
+        return LLVMConstInt(i32, (uint32_t)op->imm, 0);
+    case JITBLK_ABS_DEFERRED: {
+        LLVMValueRef addr = LLVMConstInt(i32, (uint32_t)op->imm, 0);
+        return emit_mem_load(b, i32, mem, addr);
+    }
+    case JITBLK_DISP:
+        base = shadow_get(b, i32, s, op->reg, regs);
+        disp = LLVMConstInt(i32, (uint32_t)op->imm, 0);
+        return LLVMBuildAdd(b, base, disp, "ea");
+    case JITBLK_DISP_DEFERRED:
+        base = shadow_get(b, i32, s, op->reg, regs);
+        disp = LLVMConstInt(i32, (uint32_t)op->imm, 0);
+        ea   = LLVMBuildAdd(b, base, disp, "ea");
+        return emit_mem_load(b, i32, mem, ea);
+    default:
+        return NULL;
+    }
+}
+
+/* Read the value of an operand given its pre-computed EA (NULL for non-memory). */
+static LLVMValueRef emit_read_operand(LLVMBuilderRef b, LLVMTypeRef i32,
+                                       VaxJITBlkOp *op, LLVMValueRef ea,
+                                       RegShadow *s, LLVMValueRef regs,
+                                       LLVMValueRef mem)
+{
+    switch (op->kind) {
+    case JITBLK_LITERAL:
+    case JITBLK_IMMEDIATE:
+        return LLVMConstInt(i32, (uint32_t)op->imm, 0);
+    case JITBLK_REGISTER:
+        return shadow_get(b, i32, s, op->reg, regs);
+    default:
+        return emit_mem_load(b, i32, mem, ea);
+    }
+}
+
+/* Write val to the operand's destination (shadow for register, memory via ea). */
+static void emit_write_operand(LLVMBuilderRef b, LLVMTypeRef i32,
+                                VaxJITBlkOp *op, LLVMValueRef ea,
+                                LLVMValueRef val, RegShadow *s,
+                                LLVMValueRef mem)
+{
+    if (op->kind == JITBLK_REGISTER) {
+        shadow_set(s, op->reg, val);
+    } else {
+        emit_mem_store(b, i32, mem, ea, val);
+    }
+}
+
+/* Emit IR for one VAX instruction into the current basic block. */
+static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
+                       VaxJITBlock *blk, RegShadow *s,
+                       LLVMValueRef regs, LLVMValueRef v_psl,
+                       LLVMValueRef mem)
+{
+    LLVMValueRef ea0, ea1, src, dst_old, result, cc;
+
+    switch (blk->opc) {
+
+    case VAX_OPC_NOP:
+        return;
+
+    /* ADDL2 src, dst  :  dst = dst + src */
+    case VAX_OPC_ADDL2:
+        ea0     = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
+        ea1     = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
+        src     = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
+        dst_old = emit_read_operand(b, i32, &blk->ops[1], ea1, s, regs, mem);
+        result  = LLVMBuildAdd(b, dst_old, src, "r");
+        cc      = build_cc_add(b, i32, src, dst_old, result);
+        emit_write_operand(b, i32, &blk->ops[1], ea1, result, s, mem);
+        build_psl_update(b, i32, v_psl, cc);
+        return;
+
+    /* SUBL2 src, dst  :  dst = dst - src */
+    case VAX_OPC_SUBL2:
+        ea0     = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
+        ea1     = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
+        src     = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
+        dst_old = emit_read_operand(b, i32, &blk->ops[1], ea1, s, regs, mem);
+        result  = LLVMBuildSub(b, dst_old, src, "r");
+        cc      = build_cc_sub(b, i32, src, dst_old, result);
+        emit_write_operand(b, i32, &blk->ops[1], ea1, result, s, mem);
+        build_psl_update(b, i32, v_psl, cc);
+        return;
+
+    /* BISL2 src, dst  :  dst = dst | src */
+    case VAX_OPC_BISL2:
+        ea0     = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
+        ea1     = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
+        src     = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
+        dst_old = emit_read_operand(b, i32, &blk->ops[1], ea1, s, regs, mem);
+        result  = LLVMBuildOr(b, dst_old, src, "r");
+        cc      = build_cc_logical(b, i32, result);
+        emit_write_operand(b, i32, &blk->ops[1], ea1, result, s, mem);
+        build_psl_update(b, i32, v_psl, cc);
+        return;
+
+    /* BICL2 src, dst  :  dst = dst & ~src */
+    case VAX_OPC_BICL2:
+        ea0     = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
+        ea1     = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
+        src     = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
+        dst_old = emit_read_operand(b, i32, &blk->ops[1], ea1, s, regs, mem);
+        result  = LLVMBuildAnd(b, dst_old, LLVMBuildNot(b, src, "ns"), "r");
+        cc      = build_cc_logical(b, i32, result);
+        emit_write_operand(b, i32, &blk->ops[1], ea1, result, s, mem);
+        build_psl_update(b, i32, v_psl, cc);
+        return;
+
+    /* XORL2 src, dst  :  dst = dst ^ src */
+    case VAX_OPC_XORL2:
+        ea0     = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
+        ea1     = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
+        src     = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
+        dst_old = emit_read_operand(b, i32, &blk->ops[1], ea1, s, regs, mem);
+        result  = LLVMBuildXor(b, dst_old, src, "r");
+        cc      = build_cc_logical(b, i32, result);
+        emit_write_operand(b, i32, &blk->ops[1], ea1, result, s, mem);
+        build_psl_update(b, i32, v_psl, cc);
+        return;
+
+    /* MOVL src, dst  :  dst = src */
+    case VAX_OPC_MOVL:
+        ea0    = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
+        ea1    = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
+        src    = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
+        cc     = build_cc_logical(b, i32, src);
+        emit_write_operand(b, i32, &blk->ops[1], ea1, src, s, mem);
+        build_psl_update(b, i32, v_psl, cc);
+        return;
+
+    /* MCOML src, dst  :  dst = ~src */
+    case VAX_OPC_MCOML:
+        ea0    = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
+        ea1    = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
+        src    = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
+        result = LLVMBuildNot(b, src, "r");
+        cc     = build_cc_logical(b, i32, result);
+        emit_write_operand(b, i32, &blk->ops[1], ea1, result, s, mem);
+        build_psl_update(b, i32, v_psl, cc);
+        return;
+
+    /* CMPL src1, src2  :  src1 - src2, set CC, no store */
+    case VAX_OPC_CMPL:
+        ea0     = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
+        ea1     = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
+        src     = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
+        dst_old = emit_read_operand(b, i32, &blk->ops[1], ea1, s, regs, mem);
+        result  = LLVMBuildSub(b, src, dst_old, "r");
+        cc      = build_cc_sub(b, i32, dst_old, src, result);
+        build_psl_update(b, i32, v_psl, cc);
+        return;
+
+    /* TSTL src  :  set CC_LOGICAL on src, no store */
+    case VAX_OPC_TSTL:
+        ea0 = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
+        src = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
+        cc  = build_cc_logical(b, i32, src);
+        build_psl_update(b, i32, v_psl, cc);
+        return;
+
+    /* CLRL dst  :  dst = 0 */
+    case VAX_OPC_CLRL:
+        ea0    = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
+        result = LLVMConstInt(i32, 0, 0);
+        cc     = build_cc_logical(b, i32, result);
+        emit_write_operand(b, i32, &blk->ops[0], ea0, result, s, mem);
+        build_psl_update(b, i32, v_psl, cc);
+        return;
+
+    /* INCL dst  :  dst = dst + 1 */
+    case VAX_OPC_INCL:
+        ea0     = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
+        dst_old = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
+        src     = LLVMConstInt(i32, 1, 0);
+        result  = LLVMBuildAdd(b, dst_old, src, "r");
+        cc      = build_cc_add(b, i32, src, dst_old, result);
+        emit_write_operand(b, i32, &blk->ops[0], ea0, result, s, mem);
+        build_psl_update(b, i32, v_psl, cc);
+        return;
+
+    /* DECL dst  :  dst = dst - 1 */
+    case VAX_OPC_DECL:
+        ea0     = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
+        dst_old = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
+        src     = LLVMConstInt(i32, 1, 0);
+        result  = LLVMBuildSub(b, dst_old, src, "r");
+        cc      = build_cc_sub(b, i32, src, dst_old, result);
+        emit_write_operand(b, i32, &blk->ops[0], ea0, result, s, mem);
+        build_psl_update(b, i32, v_psl, cc);
+        return;
+
+    default:
+        return;
+    }
+}
+
+/* Compile a single block to a native function and return its pointer.
+   Returns NULL on error.                                               */
+static void *compile_block(VaxJITBlock *blk)
+{
+    static uint32_t bcnt = 0;
+    char sym[32];
+    snprintf(sym, sizeof(sym), "blk_%02x_%u", (uint32_t)(uint8_t)blk->opc, bcnt++);
+
+    LLVMTypeRef i32  = LLVMInt32TypeInContext(ctx);
+    LLVMTypeRef ptr  = LLVMPointerTypeInContext(ctx, 0);
+    LLVMTypeRef ps[3] = { ptr, ptr, ptr };
+    LLVMModuleRef mod = LLVMModuleCreateWithNameInContext(sym, ctx);
+    LLVMValueRef  fn  = LLVMAddFunction(mod, sym,
+                            LLVMFunctionType(LLVMVoidTypeInContext(ctx),
+                                             ps, 3, 0));
+    LLVMBuilderRef b  = LLVMCreateBuilderInContext(ctx);
+    LLVMPositionBuilderAtEnd(b,
+        LLVMAppendBasicBlockInContext(ctx, fn, "entry"));
+
+    LLVMValueRef v_regs = LLVMGetParam(fn, 0);
+    LLVMValueRef v_psl  = LLVMGetParam(fn, 1);
+    LLVMValueRef v_mem  = LLVMGetParam(fn, 2);
+
+    RegShadow shadow;
+    int i;
+    for (i = 0; i < 16; i++) shadow.val[i] = NULL;
+
+    emit_insn(b, i32, blk, &shadow, v_regs, v_psl, v_mem);
+
+    shadow_spill(b, i32, &shadow, v_regs);
+    LLVMBuildRetVoid(b);
+    LLVMDisposeBuilder(b);
+
+    LLVMErrorRef err = jit_add_module(mod);
+    if (err) {
+        char *m = LLVMGetErrorMessage(err);
+        fprintf(stderr, "vax_jit: compile_block opc=%02x: %s\n",
+                (uint8_t)blk->opc, m);
+        LLVMDisposeErrorMessage(m);
+        return NULL;
+    }
+    return jit_lookup(sym);
+}
+
+/* ------------------------------------------------------------------ */
+/* Public block execution API                                           */
+/* ------------------------------------------------------------------ */
+
+int vax_jit_llvm_exec_block(VaxJITBlock *blk, int32_t *regs,
+                             int32_t *psl, int32_t *mem)
+{
+    typedef void (*BlockFn)(int32_t *, int32_t *, int32_t *);
+    BlockFn fn = (BlockFn)compile_block(blk);
+    if (!fn) return 0;
+    fn(regs, psl, mem);
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */

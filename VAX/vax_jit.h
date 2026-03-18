@@ -13,6 +13,7 @@
 #define VAX_JIT_H
 
 #include "vax_defs.h"
+#include "vax_jit_block.h"
 
 /* ------------------------------------------------------------------
    SIMH unit flags for the JIT.  Defined here (rather than vax_cpu.c)
@@ -28,7 +29,7 @@
    VAX specifier mode nibble constants (high nibble of each spec byte).
    The full VAX Architecture Reference Manual defines these (ch. 3).
    ------------------------------------------------------------------ */
-#define VAX_SPEC_SHORT_LIT_MAX  0x03    /* modes 0–3: short literal       */
+#define VAX_SPEC_SHORT_LIT_MAX  0x03    /* modes 0-3: short literal       */
 #define VAX_SPEC_INDEX          0x04
 #define VAX_SPEC_REGISTER       0x05    /* mode 5: register direct        */
 #define VAX_SPEC_REG_DEFERRED   0x06
@@ -51,34 +52,40 @@
 
 /* ------------------------------------------------------------------
    Decoded operand: built by vax_jit_decode_operand() in vax_jit.c.
-   The Option A hook in vax_cpu.c reads the raw bytes; this struct
-   carries the semantic result so all instruction handlers share one
-   decode path.
+   VaxJITOpKind values MUST stay in sync with VaxJITBlkOpKind in
+   vax_jit_block.h (same ordinal values; to_blk_op() casts between them).
    ------------------------------------------------------------------ */
 
 typedef enum {
-    JITOPK_UNSUPPORTED = 0, /* mode not yet handled — fall to interpreter */
+    JITOPK_UNSUPPORTED = 0, /* mode not yet handled - fall to interpreter */
     JITOPK_REGISTER,        /* R[reg]                                      */
-    JITOPK_LITERAL,         /* short literal 0–63, value in .imm           */
-    JITOPK_IMMEDIATE        /* longword immediate, value in .imm           */
+    JITOPK_LITERAL,         /* short literal 0-63, value in .imm           */
+    JITOPK_IMMEDIATE,       /* longword immediate, value in .imm           */
+    JITOPK_REG_DEFERRED,    /* (Rn)    - M[R[n]]         reg=n            */
+    JITOPK_AUTODECREMENT,   /* -(Rn)   - M[--R[n]]       reg=n            */
+    JITOPK_AUTOINCREMENT,   /* (Rn)+   - M[R[n]++]       reg=n            */
+    JITOPK_AUTOINC_DEF,     /* @(Rn)+  - M[M[R[n]++]]   reg=n            */
+    JITOPK_ABSOLUTE,        /* @#addr  - M[addr]          imm=addr         */
+    JITOPK_ABS_DEFERRED,    /* @(PCrel-deferred) - M[M[addr]] imm=addr    */
+    JITOPK_DISP,            /* d(Rn)   - M[R[n]+d]       reg=n, imm=d    */
+    JITOPK_DISP_DEFERRED,   /* @d(Rn)  - M[M[R[n]+d]]   reg=n, imm=d    */
 } VaxJITOpKind;
 
 typedef struct {
     VaxJITOpKind kind;
-    int          reg;   /* register index (JITOPK_REGISTER only)          */
-    int32        imm;   /* value (JITOPK_LITERAL / JITOPK_IMMEDIATE)      */
+    int          reg;   /* register index                                  */
+    int32        imm;   /* value for literal/immediate/displacement/addr   */
 } VaxJITOperand;
 
-/* Decode one operand from a specifier byte (already read from the stream)
-   and an optional follow longword (only consumed for immediate mode).
-   Result written into *op.                                               */
-void vax_jit_decode_operand (int32 spec, int32 follow, VaxJITOperand *op);
+/* Decode one operand from a specifier byte and an optional follow value.
+   pc_after: PC value after consuming all extension bytes for this operand
+   (used to resolve PC-relative addresses to absolute addresses).         */
+void vax_jit_decode_operand (int32 spec, int32 follow, int32 pc_after,
+                              VaxJITOperand *op);
 
-/* Returns 1 if the specifier byte requires a following longword to be
-   read from the instruction stream (immediate longword: 0x8F).
-   The caller (vax_cpu.c) uses this to know whether to call
-   get_istr(L_LONG) after the spec byte.                                  */
-int  vax_jit_operand_needs_long (int32 spec);
+/* Returns the number of extension bytes that follow the spec byte.
+   op_lnt: the logical operand size (for immediate mode).                 */
+int  vax_jit_spec_ext_lnt (int32 spec, int32 op_lnt);
 
 /* How many operands the JIT expects for this opcode.
    -1 = opcode not JIT-handled (skip hook entirely).
@@ -99,8 +106,7 @@ void vax_jit_destroy (void);
 /* 1 when JIT is enabled (SET CPU JIT), 0 when disabled (SET CPU NOJIT). */
 extern int vax_jit_enabled;
 
-/* 1 when IR dump is enabled (SET CPU JITDUMP) — prints LLVM IR for each
-   compiled handler to stderr.  Useful for inspecting generated code.    */
+/* 1 when IR dump is enabled (SET CPU JITDUMP). */
 extern int vax_jit_ir_dump;
 
 #endif /* VAX_JIT_H */
