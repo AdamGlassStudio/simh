@@ -28,6 +28,7 @@ typedef struct {
     VaxJITBlkOpKind kind;
     int             reg;
     int32_t         imm;
+    uint8_t         width;   /* operand access width: 1, 2, or 4 */
 } VaxJITBlkOp;
 
 typedef struct {

@@ -261,12 +261,13 @@ static int op_is_mem(const VaxJITOperand *op)
 /* Block path helpers                                                   */
 /* ------------------------------------------------------------------ */
 
-static VaxJITBlkOp to_blk_op(const VaxJITOperand *op)
+static VaxJITBlkOp to_blk_op(const VaxJITOperand *op, uint8_t width)
 {
     VaxJITBlkOp b;
-    b.kind = (VaxJITBlkOpKind)op->kind;  /* enums are layout-compatible */
-    b.reg  = op->reg;
-    b.imm  = (int32_t)op->imm;
+    b.kind  = (VaxJITBlkOpKind)op->kind;
+    b.reg   = op->reg;
+    b.imm   = (int32_t)op->imm;
+    b.width = width;
     return b;
 }
 
@@ -276,6 +277,11 @@ static int needs_block_path(VaxJITOperand *ops, int nops)
     for (i = 0; i < nops; i++)
         if (op_is_mem(&ops[i])) return 1;
     return 0;
+}
+
+static int always_block_path(int32 opc)
+{
+    return opc == MOVB || opc == MOVW || opc == MOVZBL || opc == MOVZWL || opc == PUSHL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -290,6 +296,10 @@ int vax_jit_noperands(int32 opc)
     case BISL2: case BICL2: case XORL2:
     case MOVL:  case CMPL:  case MCOML:
     case CLRL:  case TSTL:  case INCL:  case DECL:
+        return DR_GETNSP(drom[opc][0]);
+    case MOVB: case MOVW:
+    case MOVZBL: case MOVZWL:
+    case PUSHL:
         return DR_GETNSP(drom[opc][0]);
     default:
         return -1;
@@ -310,13 +320,24 @@ int vax_jit_execute(int32 opc, VAXCPUState *state,
     if (!vax_jit_enabled)
         return 0;
 
-    /* --- Block path: any memory-mode operand ------------------------ */
-    if (needs_block_path(ops, nops)) {
+    /* --- Block path: any memory-mode operand, or width-sensitive ops --- */
+    if (needs_block_path(ops, nops) || always_block_path(opc)) {
         VaxJITBlock blk;
         blk.opc   = opc;
         blk.n_ops = nops;
-        for (i = 0; i < nops; i++)
-            blk.ops[i] = to_blk_op(&ops[i]);
+        /* determine per-operand widths */
+        uint8_t w0 = 4, w1 = 4;
+        switch (opc) {
+        case MOVB:   w0 = 1; w1 = 1; break;
+        case MOVW:   w0 = 2; w1 = 2; break;
+        case MOVZBL: w0 = 1; w1 = 4; break;
+        case MOVZWL: w0 = 2; w1 = 4; break;
+        default:     break;
+        }
+        blk.ops[0] = (nops > 0) ? to_blk_op(&ops[0], w0) : (VaxJITBlkOp){0};
+        blk.ops[1] = (nops > 1) ? to_blk_op(&ops[1], w1) : (VaxJITBlkOp){0};
+        for (i = 2; i < nops; i++)
+            blk.ops[i] = to_blk_op(&ops[i], 4);
         return vax_jit_llvm_exec_block(&blk, regs, psl, (int32_t*)M);
     }
 
