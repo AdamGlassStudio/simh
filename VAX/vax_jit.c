@@ -281,7 +281,9 @@ static int needs_block_path(VaxJITOperand *ops, int nops)
 
 static int always_block_path(int32 opc)
 {
-    return opc == MOVB || opc == MOVW || opc == MOVZBL || opc == MOVZWL || opc == PUSHL;
+    return opc == MOVB || opc == MOVW || opc == MOVZBL || opc == MOVZWL || opc == PUSHL
+        || opc == ASHL || opc == MOVQ
+        || opc == MOVAB || opc == MOVAL || opc == PUSHAB || opc == PUSHAL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -300,6 +302,9 @@ int vax_jit_noperands(int32 opc)
     case MOVB: case MOVW:
     case MOVZBL: case MOVZWL:
     case PUSHL:
+    case ASHL: case MOVQ:
+    case MOVAB: case MOVAL:
+    case PUSHAB: case PUSHAL:
         return DR_GETNSP(drom[opc][0]);
     default:
         return -1;
@@ -332,6 +337,10 @@ int vax_jit_execute(int32 opc, VAXCPUState *state,
         case MOVW:   w0 = 2; w1 = 2; break;
         case MOVZBL: w0 = 1; w1 = 4; break;
         case MOVZWL: w0 = 2; w1 = 4; break;
+        case ASHL:   w0 = 1; w1 = 4; break;  /* ops[2] gets default 4 via loop */
+        case MOVQ:   w0 = 8; w1 = 8; break;
+        case MOVAB: case MOVAL:
+        case PUSHAB: case PUSHAL: w0 = 4; w1 = 4; break;
         default:     break;
         }
         blk.ops[0] = (nops > 0) ? to_blk_op(&ops[0], w0) : (VaxJITBlkOp){0};

@@ -437,10 +437,16 @@ static int compile_tstl(void)
 #define VAX_OPC_TSTL  0xD5
 #define VAX_OPC_INCL  0xD6
 #define VAX_OPC_DECL  0xD7
+#define VAX_OPC_ASHL   0x78
+#define VAX_OPC_MOVQ   0x7D
 #define VAX_OPC_MOVB   0x90
+#define VAX_OPC_MOVAB  0x9E
+#define VAX_OPC_PUSHAB 0x9F
 #define VAX_OPC_MOVZBL 0x9A
 #define VAX_OPC_MOVW   0xB0
 #define VAX_OPC_PUSHL  0xDD
+#define VAX_OPC_MOVAL  0xDE
+#define VAX_OPC_PUSHAL 0xDF
 
 /* ------------------------------------------------------------------ */
 /* Register shadow: tracks loaded/modified register values             */
@@ -817,6 +823,129 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
         shadow_set(s, 14, sp_new);
         emit_mem_store(b, i32, mem, sp_new, src, 4);
         cc = build_cc_logical(b, i32, src, 0xFFFFFFFFu, 0x80000000u);
+        build_psl_update(b, i32, v_psl, cc);
+        return;
+    }
+
+    /* ASHL cnt, src, dst  :  dst = src << cnt (arithmetic shift) */
+    case VAX_OPC_ASHL: {
+        LLVMContextRef lctx = LLVMGetTypeContext(i32);
+        LLVMTypeRef i8  = LLVMInt8TypeInContext(lctx);
+        LLVMTypeRef i1  = LLVMInt1TypeInContext(lctx);
+        ea0 = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
+        ea1 = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
+        LLVMValueRef ea2 = emit_operand_ea(b, i32, &blk->ops[2], s, regs, mem);
+        LLVMValueRef v_cnt = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
+        LLVMValueRef v_src = emit_read_operand(b, i32, &blk->ops[1], ea1, s, regs, mem);
+        /* sign-extend cnt from byte to i32 */
+        LLVMValueRef cnt8  = LLVMBuildTrunc(b, v_cnt, i8, "c8");
+        LLVMValueRef cnt32 = LLVMBuildSExt(b, cnt8, i32, "c32");
+        LLVMValueRef zero  = LLVMConstInt(i32, 0, 0);
+        LLVMValueRef zero1 = LLVMConstInt(i1, 0, 0);
+        LLVMValueRef c31   = LLVMConstInt(i32, 31, 0);
+        LLVMValueRef c32   = LLVMConstInt(i32, 32, 0);
+        /* determine shift direction */
+        LLVMValueRef is_left  = LLVMBuildICmp(b, LLVMIntSGT, cnt32, zero, "il");
+        LLVMValueRef is_right = LLVMBuildICmp(b, LLVMIntSLT, cnt32, zero, "ir");
+        /* absolute value of cnt */
+        LLVMValueRef neg_cnt = LLVMBuildNeg(b, cnt32, "nc");
+        LLVMValueRef abs_cnt = LLVMBuildSelect(b, is_left, cnt32, neg_cnt, "ac");
+        /* clamp to 31 for safe shifting (LLVM UB for shift >= bitwidth) */
+        LLVMValueRef big     = LLVMBuildICmp(b, LLVMIntSGE, abs_cnt, c32, "big");
+        LLVMValueRef clamped = LLVMBuildSelect(b, big, c31, abs_cnt, "cl");
+        /* left shift: cnt >= 32 → 0 */
+        LLVMValueRef shl_res  = LLVMBuildShl(b, v_src, clamped, "ls");
+        LLVMValueRef left_res = LLVMBuildSelect(b, big, zero, shl_res, "lr");
+        /* V for left shift: round-trip check (shr(shl(src,cnt),cnt) != src) */
+        LLVMValueRef recover  = LLVMBuildAShr(b, shl_res, clamped, "rv");
+        LLVMValueRef v_left   = LLVMBuildICmp(b, LLVMIntNE, recover, v_src, "vl");
+        /* V for cnt >= 32 left: V = (src != 0) */
+        LLVMValueRef v_big    = LLVMBuildICmp(b, LLVMIntNE, v_src, zero, "vb");
+        LLVMValueRef v_left_f = LLVMBuildSelect(b, big, v_big, v_left, "vlf");
+        /* right shift: cnt >= 32 → sign fill (all sign bits) */
+        LLVMValueRef shr_res   = LLVMBuildAShr(b, v_src, clamped, "rs");
+        LLVMValueRef shr_big   = LLVMBuildAShr(b, v_src, c31, "sb");
+        LLVMValueRef right_res = LLVMBuildSelect(b, big, shr_big, shr_res, "rr");
+        /* select direction */
+        result = LLVMBuildSelect(b, is_left, left_res,
+                     LLVMBuildSelect(b, is_right, right_res, v_src, "zr"), "res");
+        /* v_flag: V=1 only for left shift with overflow (i1) */
+        LLVMValueRef v_flag = LLVMBuildSelect(b, is_left, v_left_f, zero1, "vf");
+        emit_write_operand(b, i32, &blk->ops[2], ea2, result, s, regs, mem);
+        /* CC: N/Z from result, V from v_flag, C=0 always */
+        LLVMValueRef cn_m = LLVMConstInt(i32, 0x08, 0);
+        LLVMValueRef cz_m = LLVMConstInt(i32, 0x04, 0);
+        LLVMValueRef cv_m = LLVMConstInt(i32, 0x02, 0);
+        LLVMValueRef n_f  = LLVMBuildICmp(b, LLVMIntSLT, result, zero, "n");
+        LLVMValueRef z_f  = LLVMBuildICmp(b, LLVMIntEQ,  result, zero, "z");
+        LLVMValueRef pn   = LLVMBuildSelect(b, n_f,    cn_m, zero, "pn");
+        LLVMValueRef pz   = LLVMBuildSelect(b, z_f,    cz_m, zero, "pz");
+        LLVMValueRef pv   = LLVMBuildSelect(b, v_flag, cv_m, zero, "pv");
+        cc = LLVMBuildOr(b, LLVMBuildOr(b, pn, pz, "cc1"), pv, "cc");
+        build_psl_update(b, i32, v_psl, cc);
+        return;
+    }
+
+    /* MOVQ src, dst  :  dst[63:0] = src[63:0], CC on quadword */
+    case VAX_OPC_MOVQ: {
+        LLVMValueRef v_lo, v_hi;
+        LLVMValueRef zero = LLVMConstInt(i32, 0, 0);
+        /* read source quadword */
+        if (blk->ops[0].kind == JITBLK_REGISTER) {
+            v_lo = shadow_get(b, i32, s, blk->ops[0].reg,             regs);
+            v_hi = shadow_get(b, i32, s, (blk->ops[0].reg + 1) & 15, regs);
+        } else {
+            LLVMValueRef ea_lo = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
+            LLVMValueRef ea_hi = LLVMBuildAdd(b, ea_lo, LLVMConstInt(i32, 4, 0), "eahi");
+            v_lo = emit_mem_load(b, i32, mem, ea_lo, 4);
+            v_hi = emit_mem_load(b, i32, mem, ea_hi, 4);
+        }
+        /* write destination quadword */
+        if (blk->ops[1].kind == JITBLK_REGISTER) {
+            shadow_set(s, blk->ops[1].reg,             v_lo);
+            shadow_set(s, (blk->ops[1].reg + 1) & 15, v_hi);
+        } else {
+            LLVMValueRef ea_lo = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
+            LLVMValueRef ea_hi = LLVMBuildAdd(b, ea_lo, LLVMConstInt(i32, 4, 0), "eadhi");
+            emit_mem_store(b, i32, mem, ea_lo, v_lo, 4);
+            emit_mem_store(b, i32, mem, ea_hi, v_hi, 4);
+        }
+        /* CC: N = bit31 of hi, Z = (lo==0 && hi==0), V=0, C=0 */
+        LLVMValueRef n   = LLVMBuildICmp(b, LLVMIntSLT, v_hi, zero, "n");
+        LLVMValueRef lz  = LLVMBuildICmp(b, LLVMIntEQ,  v_lo, zero, "lz");
+        LLVMValueRef hz  = LLVMBuildICmp(b, LLVMIntEQ,  v_hi, zero, "hz");
+        LLVMValueRef z   = LLVMBuildAnd(b, lz, hz, "z");
+        LLVMValueRef cn_m = LLVMConstInt(i32, 0x08, 0);
+        LLVMValueRef cz_m = LLVMConstInt(i32, 0x04, 0);
+        LLVMValueRef pn  = LLVMBuildSelect(b, n, cn_m, zero, "pn");
+        LLVMValueRef pz  = LLVMBuildSelect(b, z, cz_m, zero, "pz");
+        cc = LLVMBuildOr(b, pn, pz, "cc");
+        build_psl_update(b, i32, v_psl, cc);
+        return;
+    }
+
+    /* MOVAB/MOVAL src, dst  :  dst = EA(src) */
+    case VAX_OPC_MOVAB:
+    case VAX_OPC_MOVAL: {
+        LLVMValueRef ea = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
+        if (!ea) return;   /* register mode: architecturally unpredictable */
+        ea1 = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
+        emit_write_operand(b, i32, &blk->ops[1], ea1, ea, s, regs, mem);
+        cc = build_cc_logical(b, i32, ea, 0xFFFFFFFFu, 0x80000000u);
+        build_psl_update(b, i32, v_psl, cc);
+        return;
+    }
+
+    /* PUSHAB/PUSHAL src  :  *(--SP) = EA(src) */
+    case VAX_OPC_PUSHAB:
+    case VAX_OPC_PUSHAL: {
+        LLVMValueRef ea = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
+        if (!ea) return;   /* register mode: architecturally unpredictable */
+        LLVMValueRef sp     = shadow_get(b, i32, s, 14, regs);
+        LLVMValueRef sp_new = LLVMBuildSub(b, sp, LLVMConstInt(i32, 4, 0), "sp");
+        shadow_set(s, 14, sp_new);
+        emit_mem_store(b, i32, mem, sp_new, ea, 4);
+        cc = build_cc_logical(b, i32, ea, 0xFFFFFFFFu, 0x80000000u);
         build_psl_update(b, i32, v_psl, cc);
         return;
     }
