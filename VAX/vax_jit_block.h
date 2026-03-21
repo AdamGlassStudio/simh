@@ -35,5 +35,13 @@ typedef struct {
     int32_t     opc;
     int         n_ops;
     VaxJITBlkOp ops[VAX_JIT_MAX_OPS];
+} VaxJITBlkInsn;
+
+#define VAX_JIT_MAX_INSNS 32
+
+typedef struct {
+    int           n_insns;
+    int32_t       fallthrough_pc;  /* PC after the last instruction */
+    VaxJITBlkInsn insns[VAX_JIT_MAX_INSNS];
 } VaxJITBlock;
 #endif /* VAX_JIT_BLOCK_H */

@@ -99,6 +99,18 @@ int  vax_jit_noperands (int32 opc);
 int  vax_jit_execute (int32 opc, VAXCPUState *state,
                       VaxJITOperand *ops, int nops);
 
+/* Scan VAX instructions from start_pc in mem[], building a multi-instruction
+   block.  Stops at branch/call/return opcodes, unknown opcodes, unsupported
+   operand modes, or VAX_JIT_MAX_INSNS instructions.
+   fallthrough_pc is set to the PC after the last accepted instruction.   */
+void vax_jit_scan_block (int32_t start_pc, VaxJITBlock *blk, int32_t *mem);
+
+/* Compile and execute a multi-instruction block.
+   Writes fallthrough_pc into regs[15] before returning.
+   Returns 1 on success, 0 on compile failure.                           */
+int  vax_jit_llvm_exec_block (VaxJITBlock *blk, int32_t *regs,
+                               int32_t *psl, int32_t *mem);
+
 /* Initialise / shut down the LLVM ORC JIT engine.                       */
 int  vax_jit_init    (void);
 void vax_jit_destroy (void);

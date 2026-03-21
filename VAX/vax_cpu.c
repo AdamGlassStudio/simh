@@ -702,6 +702,32 @@ for ( ;; ) {
         ABORT (STOP_IBKPT);                             /* stop simulation */
         }
 
+    /* JIT multi-instruction block hook: scan from current PC, compile and
+       run a block of instructions sharing a single register shadow.
+       If the block runs successfully (n_insns > 0 and exec returns 1),
+       PC is already updated in cpu_state.R[15]; skip the interpreter for
+       every instruction in the block.  Falls through to the interpreter
+       for the first instruction the scanner could not handle.           */
+    if (vax_jit_enabled) {
+        VaxJITBlock blk;
+        vax_jit_scan_block(PC, &blk, (int32_t *)M);
+        if (blk.n_insns > 0) {
+            if (vax_jit_llvm_exec_block(&blk, R, &PSL,
+                                        (int32_t *)M)) {
+                /* Block ran: account for all instructions executed.
+                   sim_interval adjustment: subtract (n_insns) instructions.
+                   The normal path subtracts 1 below; we subtract the rest. */
+                sim_interval = sim_interval - blk.n_insns;
+                extra_bytes  = 0;
+                /* Sync the prefetch buffer to the updated PC */
+                ibufl = ibufh = 0;
+                ibcnt = 0;
+                ppc   = PC;
+                continue;
+            }
+        }
+    }
+
     sim_interval = sim_interval - (1 + (extra_bytes>>5));/* count instr */
     extra_bytes = 0;                                    /* digest string count */
     GET_ISTR (opc, L_BYTE);                             /* get opcode */
@@ -710,42 +736,6 @@ for ( ;; ) {
         opc = opc | 0x100;                              /* flag */
         }
     numspec = drom[opc][0];                             /* get # specs */
-
-    /* JIT Option A hook: attempt JIT before interpreter operand decode.
-       Operands are decoded here (get_istr is static to this file) and
-       passed to vax_jit_execute as VaxJITOperand structs.  If the JIT
-       returns 1 the instruction is fully handled — continue the loop.
-       If the JIT returns 0 (unsupported operand mode or opcode), restore
-       the prefetch state so the interpreter spec loop sees intact bytes.
-       Immediate operand lengths come from drom so byte/word/long ops
-       are all handled correctly.                                       */
-    {
-        int jit_nops = vax_jit_enabled ? vax_jit_noperands(opc) : -1;
-        if (jit_nops >= 0) {
-            VaxJITOperand ops[MAX_SPEC];
-            int32 sv_pc    = PC;
-            int32 sv_ibufl = ibufl,  sv_ibufh = ibufh;
-            int32 sv_ibcnt = ibcnt,  sv_ppc   = ppc;
-            int   i;
-            for (i = 0; i < jit_nops; i++) {
-                int32 spec    = get_istr(L_BYTE, acc);
-                int32 follow  = 0;
-                int   ext_lnt = vax_jit_spec_ext_lnt(spec, DR_LNT(drom[opc][i + 1]));
-                if (ext_lnt > 0)
-                    follow = get_istr(ext_lnt, acc);
-                {
-                int32 pc_after = PC;
-                vax_jit_decode_operand(spec, follow, pc_after, &ops[i]);
-                }
-            }
-            if (vax_jit_execute(opc, &cpu_state, ops, jit_nops))
-                continue;
-            /* JIT declined — restore prefetch state */
-            PC    = sv_pc;
-            ibufl = sv_ibufl; ibufh = sv_ibufh;
-            ibcnt = sv_ibcnt; ppc   = sv_ppc;
-        }
-    }
 
 #if !defined(FULL_VAX)
     if (((DR_GETIGRP(numspec) == DR_GETIGRP(IG_BSDFL)) && (!(cpu_instruction_set & VAX_DFLOAT))) ||

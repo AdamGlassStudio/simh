@@ -631,104 +631,104 @@ static void emit_write_operand(LLVMBuilderRef b, LLVMTypeRef i32,
 
 /* Emit IR for one VAX instruction into the current basic block. */
 static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
-                       VaxJITBlock *blk, RegShadow *s,
+                       VaxJITBlkInsn *insn, RegShadow *s,
                        LLVMValueRef regs, LLVMValueRef v_psl,
                        LLVMValueRef mem)
 {
     LLVMValueRef ea0, ea1, src, dst_old, result, cc;
 
-    switch (blk->opc) {
+    switch (insn->opc) {
 
     case VAX_OPC_NOP:
         return;
 
     /* ADDL2 src, dst  :  dst = dst + src */
     case VAX_OPC_ADDL2:
-        ea0     = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
-        ea1     = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
-        src     = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
-        dst_old = emit_read_operand(b, i32, &blk->ops[1], ea1, s, regs, mem);
+        ea0     = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        ea1     = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
+        src     = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
+        dst_old = emit_read_operand(b, i32, &insn->ops[1], ea1, s, regs, mem);
         result  = LLVMBuildAdd(b, dst_old, src, "r");
         cc      = build_cc_add(b, i32, src, dst_old, result, 0xFFFFFFFFu, 0x80000000u);
-        emit_write_operand(b, i32, &blk->ops[1], ea1, result, s, regs, mem);
+        emit_write_operand(b, i32, &insn->ops[1], ea1, result, s, regs, mem);
         build_psl_update(b, i32, v_psl, cc);
         return;
 
     /* SUBL2 src, dst  :  dst = dst - src */
     case VAX_OPC_SUBL2:
-        ea0     = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
-        ea1     = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
-        src     = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
-        dst_old = emit_read_operand(b, i32, &blk->ops[1], ea1, s, regs, mem);
+        ea0     = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        ea1     = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
+        src     = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
+        dst_old = emit_read_operand(b, i32, &insn->ops[1], ea1, s, regs, mem);
         result  = LLVMBuildSub(b, dst_old, src, "r");
         cc      = build_cc_sub(b, i32, src, dst_old, result, 0xFFFFFFFFu, 0x80000000u);
-        emit_write_operand(b, i32, &blk->ops[1], ea1, result, s, regs, mem);
+        emit_write_operand(b, i32, &insn->ops[1], ea1, result, s, regs, mem);
         build_psl_update(b, i32, v_psl, cc);
         return;
 
     /* BISL2 src, dst  :  dst = dst | src */
     case VAX_OPC_BISL2:
-        ea0     = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
-        ea1     = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
-        src     = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
-        dst_old = emit_read_operand(b, i32, &blk->ops[1], ea1, s, regs, mem);
+        ea0     = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        ea1     = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
+        src     = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
+        dst_old = emit_read_operand(b, i32, &insn->ops[1], ea1, s, regs, mem);
         result  = LLVMBuildOr(b, dst_old, src, "r");
         cc      = build_cc_logical(b, i32, result, 0xFFFFFFFFu, 0x80000000u);
-        emit_write_operand(b, i32, &blk->ops[1], ea1, result, s, regs, mem);
+        emit_write_operand(b, i32, &insn->ops[1], ea1, result, s, regs, mem);
         build_psl_update(b, i32, v_psl, cc);
         return;
 
     /* BICL2 src, dst  :  dst = dst & ~src */
     case VAX_OPC_BICL2:
-        ea0     = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
-        ea1     = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
-        src     = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
-        dst_old = emit_read_operand(b, i32, &blk->ops[1], ea1, s, regs, mem);
+        ea0     = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        ea1     = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
+        src     = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
+        dst_old = emit_read_operand(b, i32, &insn->ops[1], ea1, s, regs, mem);
         result  = LLVMBuildAnd(b, dst_old, LLVMBuildNot(b, src, "ns"), "r");
         cc      = build_cc_logical(b, i32, result, 0xFFFFFFFFu, 0x80000000u);
-        emit_write_operand(b, i32, &blk->ops[1], ea1, result, s, regs, mem);
+        emit_write_operand(b, i32, &insn->ops[1], ea1, result, s, regs, mem);
         build_psl_update(b, i32, v_psl, cc);
         return;
 
     /* XORL2 src, dst  :  dst = dst ^ src */
     case VAX_OPC_XORL2:
-        ea0     = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
-        ea1     = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
-        src     = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
-        dst_old = emit_read_operand(b, i32, &blk->ops[1], ea1, s, regs, mem);
+        ea0     = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        ea1     = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
+        src     = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
+        dst_old = emit_read_operand(b, i32, &insn->ops[1], ea1, s, regs, mem);
         result  = LLVMBuildXor(b, dst_old, src, "r");
         cc      = build_cc_logical(b, i32, result, 0xFFFFFFFFu, 0x80000000u);
-        emit_write_operand(b, i32, &blk->ops[1], ea1, result, s, regs, mem);
+        emit_write_operand(b, i32, &insn->ops[1], ea1, result, s, regs, mem);
         build_psl_update(b, i32, v_psl, cc);
         return;
 
     /* MOVL src, dst  :  dst = src */
     case VAX_OPC_MOVL:
-        ea0    = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
-        ea1    = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
-        src    = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
+        ea0    = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        ea1    = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
+        src    = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
         cc     = build_cc_logical(b, i32, src, 0xFFFFFFFFu, 0x80000000u);
-        emit_write_operand(b, i32, &blk->ops[1], ea1, src, s, regs, mem);
+        emit_write_operand(b, i32, &insn->ops[1], ea1, src, s, regs, mem);
         build_psl_update(b, i32, v_psl, cc);
         return;
 
     /* MCOML src, dst  :  dst = ~src */
     case VAX_OPC_MCOML:
-        ea0    = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
-        ea1    = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
-        src    = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
+        ea0    = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        ea1    = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
+        src    = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
         result = LLVMBuildNot(b, src, "r");
         cc     = build_cc_logical(b, i32, result, 0xFFFFFFFFu, 0x80000000u);
-        emit_write_operand(b, i32, &blk->ops[1], ea1, result, s, regs, mem);
+        emit_write_operand(b, i32, &insn->ops[1], ea1, result, s, regs, mem);
         build_psl_update(b, i32, v_psl, cc);
         return;
 
     /* CMPL src1, src2  :  src1 - src2, set CC, no store */
     case VAX_OPC_CMPL:
-        ea0     = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
-        ea1     = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
-        src     = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
-        dst_old = emit_read_operand(b, i32, &blk->ops[1], ea1, s, regs, mem);
+        ea0     = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        ea1     = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
+        src     = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
+        dst_old = emit_read_operand(b, i32, &insn->ops[1], ea1, s, regs, mem);
         result  = LLVMBuildSub(b, src, dst_old, "r");
         cc      = build_cc_sub(b, i32, dst_old, src, result, 0xFFFFFFFFu, 0x80000000u);
         build_psl_update(b, i32, v_psl, cc);
@@ -736,88 +736,88 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
 
     /* TSTL src  :  set CC_LOGICAL on src, no store */
     case VAX_OPC_TSTL:
-        ea0 = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
-        src = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
+        ea0 = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        src = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
         cc  = build_cc_logical(b, i32, src, 0xFFFFFFFFu, 0x80000000u);
         build_psl_update(b, i32, v_psl, cc);
         return;
 
     /* CLRL dst  :  dst = 0 */
     case VAX_OPC_CLRL:
-        ea0    = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
+        ea0    = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
         result = LLVMConstInt(i32, 0, 0);
         cc     = build_cc_logical(b, i32, result, 0xFFFFFFFFu, 0x80000000u);
-        emit_write_operand(b, i32, &blk->ops[0], ea0, result, s, regs, mem);
+        emit_write_operand(b, i32, &insn->ops[0], ea0, result, s, regs, mem);
         build_psl_update(b, i32, v_psl, cc);
         return;
 
     /* INCL dst  :  dst = dst + 1 */
     case VAX_OPC_INCL:
-        ea0     = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
-        dst_old = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
+        ea0     = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        dst_old = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
         src     = LLVMConstInt(i32, 1, 0);
         result  = LLVMBuildAdd(b, dst_old, src, "r");
         cc      = build_cc_add(b, i32, src, dst_old, result, 0xFFFFFFFFu, 0x80000000u);
-        emit_write_operand(b, i32, &blk->ops[0], ea0, result, s, regs, mem);
+        emit_write_operand(b, i32, &insn->ops[0], ea0, result, s, regs, mem);
         build_psl_update(b, i32, v_psl, cc);
         return;
 
     /* DECL dst  :  dst = dst - 1 */
     case VAX_OPC_DECL:
-        ea0     = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
-        dst_old = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
+        ea0     = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        dst_old = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
         src     = LLVMConstInt(i32, 1, 0);
         result  = LLVMBuildSub(b, dst_old, src, "r");
         cc      = build_cc_sub(b, i32, src, dst_old, result, 0xFFFFFFFFu, 0x80000000u);
-        emit_write_operand(b, i32, &blk->ops[0], ea0, result, s, regs, mem);
+        emit_write_operand(b, i32, &insn->ops[0], ea0, result, s, regs, mem);
         build_psl_update(b, i32, v_psl, cc);
         return;
 
     /* MOVB src, dst  :  dst[7:0] = src[7:0], CC on byte */
     case VAX_OPC_MOVB:
-        ea0 = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
-        ea1 = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
-        src = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
+        ea0 = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        ea1 = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
+        src = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
         cc  = build_cc_logical(b, i32, src, 0xFFu, 0x80u);
-        emit_write_operand(b, i32, &blk->ops[1], ea1, src, s, regs, mem);
+        emit_write_operand(b, i32, &insn->ops[1], ea1, src, s, regs, mem);
         build_psl_update(b, i32, v_psl, cc);
         return;
 
     /* MOVW src, dst  :  dst[15:0] = src[15:0], CC on word */
     case VAX_OPC_MOVW:
-        ea0 = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
-        ea1 = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
-        src = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
+        ea0 = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        ea1 = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
+        src = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
         cc  = build_cc_logical(b, i32, src, 0xFFFFu, 0x8000u);
-        emit_write_operand(b, i32, &blk->ops[1], ea1, src, s, regs, mem);
+        emit_write_operand(b, i32, &insn->ops[1], ea1, src, s, regs, mem);
         build_psl_update(b, i32, v_psl, cc);
         return;
 
     /* MOVZBL src, dst  :  dst = zero_extend(src[7:0]), CC on longword */
     case VAX_OPC_MOVZBL:
-        ea0 = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
-        ea1 = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
-        src = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
+        ea0 = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        ea1 = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
+        src = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
         cc  = build_cc_logical(b, i32, src, 0xFFFFFFFFu, 0x80000000u);
-        emit_write_operand(b, i32, &blk->ops[1], ea1, src, s, regs, mem);
+        emit_write_operand(b, i32, &insn->ops[1], ea1, src, s, regs, mem);
         build_psl_update(b, i32, v_psl, cc);
         return;
 
     /* MOVZWL src, dst  :  dst = zero_extend(src[15:0]), CC on longword */
     case VAX_OPC_MOVZWL:
-        ea0 = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
-        ea1 = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
-        src = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
+        ea0 = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        ea1 = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
+        src = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
         cc  = build_cc_logical(b, i32, src, 0xFFFFFFFFu, 0x80000000u);
-        emit_write_operand(b, i32, &blk->ops[1], ea1, src, s, regs, mem);
+        emit_write_operand(b, i32, &insn->ops[1], ea1, src, s, regs, mem);
         build_psl_update(b, i32, v_psl, cc);
         return;
 
     /* PUSHL src  :  *(--SP) = src, CC on longword */
     case VAX_OPC_PUSHL: {
         LLVMValueRef sp, sp_new;
-        ea0    = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
-        src    = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
+        ea0    = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        src    = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
         sp     = shadow_get(b, i32, s, 14, regs);
         sp_new = LLVMBuildSub(b, sp, LLVMConstInt(i32, 4, 0), "sp_dec");
         shadow_set(s, 14, sp_new);
@@ -832,11 +832,11 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
         LLVMContextRef lctx = LLVMGetTypeContext(i32);
         LLVMTypeRef i8  = LLVMInt8TypeInContext(lctx);
         LLVMTypeRef i1  = LLVMInt1TypeInContext(lctx);
-        ea0 = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
-        ea1 = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
-        LLVMValueRef ea2 = emit_operand_ea(b, i32, &blk->ops[2], s, regs, mem);
-        LLVMValueRef v_cnt = emit_read_operand(b, i32, &blk->ops[0], ea0, s, regs, mem);
-        LLVMValueRef v_src = emit_read_operand(b, i32, &blk->ops[1], ea1, s, regs, mem);
+        ea0 = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        ea1 = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
+        LLVMValueRef ea2 = emit_operand_ea(b, i32, &insn->ops[2], s, regs, mem);
+        LLVMValueRef v_cnt = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
+        LLVMValueRef v_src = emit_read_operand(b, i32, &insn->ops[1], ea1, s, regs, mem);
         /* sign-extend cnt from byte to i32 */
         LLVMValueRef cnt8  = LLVMBuildTrunc(b, v_cnt, i8, "c8");
         LLVMValueRef cnt32 = LLVMBuildSExt(b, cnt8, i32, "c32");
@@ -871,7 +871,7 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
                      LLVMBuildSelect(b, is_right, right_res, v_src, "zr"), "res");
         /* v_flag: V=1 only for left shift with overflow (i1) */
         LLVMValueRef v_flag = LLVMBuildSelect(b, is_left, v_left_f, zero1, "vf");
-        emit_write_operand(b, i32, &blk->ops[2], ea2, result, s, regs, mem);
+        emit_write_operand(b, i32, &insn->ops[2], ea2, result, s, regs, mem);
         /* CC: N/Z from result, V from v_flag, C=0 always */
         LLVMValueRef cn_m = LLVMConstInt(i32, 0x08, 0);
         LLVMValueRef cz_m = LLVMConstInt(i32, 0x04, 0);
@@ -891,21 +891,21 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
         LLVMValueRef v_lo, v_hi;
         LLVMValueRef zero = LLVMConstInt(i32, 0, 0);
         /* read source quadword */
-        if (blk->ops[0].kind == JITBLK_REGISTER) {
-            v_lo = shadow_get(b, i32, s, blk->ops[0].reg,             regs);
-            v_hi = shadow_get(b, i32, s, (blk->ops[0].reg + 1) & 15, regs);
+        if (insn->ops[0].kind == JITBLK_REGISTER) {
+            v_lo = shadow_get(b, i32, s, insn->ops[0].reg,             regs);
+            v_hi = shadow_get(b, i32, s, (insn->ops[0].reg + 1) & 15, regs);
         } else {
-            LLVMValueRef ea_lo = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
+            LLVMValueRef ea_lo = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
             LLVMValueRef ea_hi = LLVMBuildAdd(b, ea_lo, LLVMConstInt(i32, 4, 0), "eahi");
             v_lo = emit_mem_load(b, i32, mem, ea_lo, 4);
             v_hi = emit_mem_load(b, i32, mem, ea_hi, 4);
         }
         /* write destination quadword */
-        if (blk->ops[1].kind == JITBLK_REGISTER) {
-            shadow_set(s, blk->ops[1].reg,             v_lo);
-            shadow_set(s, (blk->ops[1].reg + 1) & 15, v_hi);
+        if (insn->ops[1].kind == JITBLK_REGISTER) {
+            shadow_set(s, insn->ops[1].reg,             v_lo);
+            shadow_set(s, (insn->ops[1].reg + 1) & 15, v_hi);
         } else {
-            LLVMValueRef ea_lo = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
+            LLVMValueRef ea_lo = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
             LLVMValueRef ea_hi = LLVMBuildAdd(b, ea_lo, LLVMConstInt(i32, 4, 0), "eadhi");
             emit_mem_store(b, i32, mem, ea_lo, v_lo, 4);
             emit_mem_store(b, i32, mem, ea_hi, v_hi, 4);
@@ -927,10 +927,10 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
     /* MOVAB/MOVAL src, dst  :  dst = EA(src) */
     case VAX_OPC_MOVAB:
     case VAX_OPC_MOVAL: {
-        LLVMValueRef ea = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
+        LLVMValueRef ea = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
         if (!ea) return;   /* register mode: architecturally unpredictable */
-        ea1 = emit_operand_ea(b, i32, &blk->ops[1], s, regs, mem);
-        emit_write_operand(b, i32, &blk->ops[1], ea1, ea, s, regs, mem);
+        ea1 = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
+        emit_write_operand(b, i32, &insn->ops[1], ea1, ea, s, regs, mem);
         cc = build_cc_logical(b, i32, ea, 0xFFFFFFFFu, 0x80000000u);
         build_psl_update(b, i32, v_psl, cc);
         return;
@@ -939,7 +939,7 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
     /* PUSHAB/PUSHAL src  :  *(--SP) = EA(src) */
     case VAX_OPC_PUSHAB:
     case VAX_OPC_PUSHAL: {
-        LLVMValueRef ea = emit_operand_ea(b, i32, &blk->ops[0], s, regs, mem);
+        LLVMValueRef ea = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
         if (!ea) return;   /* register mode: architecturally unpredictable */
         LLVMValueRef sp     = shadow_get(b, i32, s, 14, regs);
         LLVMValueRef sp_new = LLVMBuildSub(b, sp, LLVMConstInt(i32, 4, 0), "sp");
@@ -955,13 +955,16 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
     }
 }
 
-/* Compile a single block to a native function and return its pointer.
+/* Compile all instructions in the block to a single native function.
+   Uses a shared RegShadow across all instructions — no inter-instruction
+   flush.  Writes blk->fallthrough_pc into regs[15] before the final spill.
    Returns NULL on error.                                               */
 static void *compile_block(VaxJITBlock *blk)
 {
     static uint32_t bcnt = 0;
     char sym[32];
-    snprintf(sym, sizeof(sym), "blk_%02x_%u", (uint32_t)(uint8_t)blk->opc, bcnt++);
+    int32_t first_opc = blk->n_insns > 0 ? blk->insns[0].opc : 0;
+    snprintf(sym, sizeof(sym), "blk_%02x_%u", (uint32_t)(uint8_t)first_opc, bcnt++);
 
     LLVMTypeRef i32  = LLVMInt32TypeInContext(ctx);
     LLVMTypeRef ptr  = LLVMPointerTypeInContext(ctx, 0);
@@ -982,7 +985,13 @@ static void *compile_block(VaxJITBlock *blk)
     int i;
     for (i = 0; i < 16; i++) shadow.val[i] = NULL;
 
-    emit_insn(b, i32, blk, &shadow, v_regs, v_psl, v_mem);
+    /* Emit all instructions with a single shared shadow */
+    for (i = 0; i < blk->n_insns; i++)
+        emit_insn(b, i32, &blk->insns[i], &shadow, v_regs, v_psl, v_mem);
+
+    /* Write the fall-through PC into the shadow before spilling */
+    shadow_set(&shadow, 15,
+               LLVMConstInt(i32, (uint32_t)blk->fallthrough_pc, 0));
 
     shadow_spill(b, i32, &shadow, v_regs);
     LLVMBuildRetVoid(b);
@@ -992,7 +1001,7 @@ static void *compile_block(VaxJITBlock *blk)
     if (err) {
         char *m = LLVMGetErrorMessage(err);
         fprintf(stderr, "vax_jit: compile_block opc=%02x: %s\n",
-                (uint8_t)blk->opc, m);
+                (uint8_t)first_opc, m);
         LLVMDisposeErrorMessage(m);
         return NULL;
     }

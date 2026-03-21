@@ -258,7 +258,7 @@ static int op_is_mem(const VaxJITOperand *op)
                                                    : (int32_t)(op)->imm)
 
 /* ------------------------------------------------------------------ */
-/* Block path helpers                                                   */
+/* Block path helpers (used by both scanner and vax_jit_execute)      */
 /* ------------------------------------------------------------------ */
 
 static VaxJITBlkOp to_blk_op(const VaxJITOperand *op, uint8_t width)
@@ -284,6 +284,154 @@ static int always_block_path(int32 opc)
     return opc == MOVB || opc == MOVW || opc == MOVZBL || opc == MOVZWL || opc == PUSHL
         || opc == ASHL || opc == MOVQ
         || opc == MOVAB || opc == MOVAL || opc == PUSHAB || opc == PUSHAL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Scanner: direct memory read helpers                                 */
+/* ------------------------------------------------------------------ */
+
+static uint8_t scan_read_byte(int32_t addr, int32_t *mem)
+{
+    return (uint8_t)((mem[addr >> 2] >> ((addr & 3) << 3)) & 0xFF);
+}
+
+static int32_t scan_read_word(int32_t addr, int32_t *mem)
+{
+    return (int32_t)(int16_t)((uint16_t)scan_read_byte(addr, mem) |
+                               ((uint16_t)scan_read_byte(addr + 1, mem) << 8));
+}
+
+static int32_t scan_read_long(int32_t addr, int32_t *mem)
+{
+    return (int32_t)((uint32_t)scan_read_byte(addr,     mem)        |
+                     ((uint32_t)scan_read_byte(addr + 1, mem) << 8)  |
+                     ((uint32_t)scan_read_byte(addr + 2, mem) << 16) |
+                     ((uint32_t)scan_read_byte(addr + 3, mem) << 24));
+}
+
+/* Returns the access width (bytes) for operand op_idx of opcode opc. */
+static uint8_t vax_jit_scan_op_lnt(int32_t opc, int op_idx)
+{
+    switch (opc) {
+    case MOVB:   return 1;
+    case MOVW:   return 2;
+    case MOVZBL: return (op_idx == 0) ? 1 : 4;
+    case MOVZWL: return (op_idx == 0) ? 2 : 4;
+    case ASHL:   return (op_idx == 0) ? 1 : 4;
+    case MOVQ:   return 8;
+    default:     return 4;
+    }
+}
+
+/* Returns 1 if opc is a branch/jump/call/return that terminates a block. */
+static int is_branch_opc(int32_t opc)
+{
+    switch (opc) {
+    case 0x04: /* RET    */
+    case 0x05: /* RSB    */
+    case 0x10: /* BSBB   */
+    case 0x11: /* BRB    */
+    case 0x12: /* BNEQ   */
+    case 0x13: /* BEQL   */
+    case 0x14: /* BGTR   */
+    case 0x15: /* BLEQ   */
+    case 0x16: /* JSB    */
+    case 0x17: /* JMP    */
+    case 0x18: /* BGEQ   */
+    case 0x19: /* BLSS   */
+    case 0x1A: /* BGTRU  */
+    case 0x1B: /* BLEQU  */
+    case 0x1C: /* BVC    */
+    case 0x1D: /* BVS    */
+    case 0x1E: /* BGEQU  */
+    case 0x1F: /* BLSSU  */
+    case 0x30: /* BSBW   */
+    case 0x31: /* BRW    */
+    case 0xE0: /* BBS    */
+    case 0xE1: /* BBC    */
+    case 0xE2: /* BBSS   */
+    case 0xE3: /* BBCS   */
+    case 0xE4: /* BBSC   */
+    case 0xE5: /* BBCC   */
+    case 0xE8: /* BLBS   */
+    case 0xE9: /* BLBC   */
+    case 0xFA: /* CALLG  */
+    case 0xFB: /* CALLS  */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Scan VAX instructions from start_pc in mem[], filling blk.
+   Stops at: branch/call/return opcodes, unknown/unsupported opcodes,
+   unsupported operand modes, or VAX_JIT_MAX_INSNS instructions.
+   Records the PC after the last accepted instruction as fallthrough_pc. */
+void vax_jit_scan_block(int32_t start_pc, VaxJITBlock *blk, int32_t *mem)
+{
+    int32_t pc = start_pc;
+    int i;
+    blk->n_insns        = 0;
+    blk->fallthrough_pc = start_pc;
+
+    while (blk->n_insns < VAX_JIT_MAX_INSNS) {
+        int32_t opc = (int32_t)(uint8_t)scan_read_byte(pc, mem);
+        pc++;
+
+        /* Extended opcode (0xFD prefix) */
+        if (opc == 0xFD) {
+            opc = 0x100 | (int32_t)(uint8_t)scan_read_byte(pc, mem);
+            pc++;
+        }
+
+        /* Stop before any branch/call/return */
+        if (is_branch_opc(opc))
+            break;
+
+        /* Stop if opcode is not JIT-handled */
+        int nops = vax_jit_noperands(opc);
+        if (nops < 0)
+            break;
+
+        /* Decode operands */
+        VaxJITBlkInsn insn;
+        insn.opc   = opc;
+        insn.n_ops = nops;
+        int ok = 1;
+
+        for (i = 0; i < nops; i++) {
+            int32_t spec    = (int32_t)(uint8_t)scan_read_byte(pc, mem);
+            pc++;
+            uint8_t op_lnt  = vax_jit_scan_op_lnt(opc, i);
+            int     ext_lnt = vax_jit_spec_ext_lnt(spec, (int32)op_lnt);
+
+            /* Can't represent ext_lnt > 4 in a single int32_t follow value */
+            if (ext_lnt > 4) { ok = 0; break; }
+
+            int32_t follow = 0;
+            if (ext_lnt == 1)
+                follow = (int32_t)(int8_t)scan_read_byte(pc, mem);
+            else if (ext_lnt == 2)
+                follow = scan_read_word(pc, mem);
+            else if (ext_lnt == 4)
+                follow = scan_read_long(pc, mem);
+            pc += ext_lnt;
+
+            int32_t pc_after = pc;
+
+            VaxJITOperand op;
+            vax_jit_decode_operand(spec, follow, pc_after, &op);
+            if (op.kind == JITOPK_UNSUPPORTED) { ok = 0; break; }
+
+            insn.ops[i] = to_blk_op(&op, op_lnt);
+        }
+
+        if (!ok)
+            break;
+
+        blk->insns[blk->n_insns++] = insn;
+        blk->fallthrough_pc = pc;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -328,8 +476,11 @@ int vax_jit_execute(int32 opc, VAXCPUState *state,
     /* --- Block path: any memory-mode operand, or width-sensitive ops --- */
     if (needs_block_path(ops, nops) || always_block_path(opc)) {
         VaxJITBlock blk;
-        blk.opc   = opc;
-        blk.n_ops = nops;
+        VaxJITBlkInsn *insn = &blk.insns[0];
+        blk.n_insns        = 1;
+        blk.fallthrough_pc = state->R[nPC];  /* PC already advanced past instruction */
+        insn->opc   = opc;
+        insn->n_ops = nops;
         /* determine per-operand widths */
         uint8_t w0 = 4, w1 = 4;
         switch (opc) {
@@ -343,10 +494,10 @@ int vax_jit_execute(int32 opc, VAXCPUState *state,
         case PUSHAB: case PUSHAL: w0 = 4; w1 = 4; break;
         default:     break;
         }
-        blk.ops[0] = (nops > 0) ? to_blk_op(&ops[0], w0) : (VaxJITBlkOp){0};
-        blk.ops[1] = (nops > 1) ? to_blk_op(&ops[1], w1) : (VaxJITBlkOp){0};
+        insn->ops[0] = (nops > 0) ? to_blk_op(&ops[0], w0) : (VaxJITBlkOp){0};
+        insn->ops[1] = (nops > 1) ? to_blk_op(&ops[1], w1) : (VaxJITBlkOp){0};
         for (i = 2; i < nops; i++)
-            blk.ops[i] = to_blk_op(&ops[i], 4);
+            insn->ops[i] = to_blk_op(&ops[i], 4);
         return vax_jit_llvm_exec_block(&blk, regs, psl, (int32_t*)M);
     }
 
