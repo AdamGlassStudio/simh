@@ -198,12 +198,23 @@ static LLVMValueRef build_cc_logical(LLVMBuilderRef b, LLVMTypeRef i32,
     return LLVMBuildOr(b, nb, zb, "cc");
 }
 
-/* PSL = (PSL & ~0xF) | cc_bits */
+/* PSL = (PSL & ~0xF) | cc_bits  — for arithmetic ops: replaces all 4 CC bits */
 static void build_psl_update(LLVMBuilderRef b, LLVMTypeRef i32,
                               LLVMValueRef v_psl, LLVMValueRef cc)
 {
     LLVMValueRef old  = LLVMBuildLoad2(b, i32, v_psl, "po");
     LLVMValueRef mask = LLVMConstInt(i32, 0xFFFFFFF0u, 0);
+    LLVMBuildStore(b, LLVMBuildOr(b,
+                       LLVMBuildAnd(b, old, mask, "pm"),
+                       cc, "pn"), v_psl);
+}
+
+/* PSL = (PSL & ~0xE) | cc_bits  — for logical ops: preserves C (VAX spec) */
+static void build_psl_update_logical(LLVMBuilderRef b, LLVMTypeRef i32,
+                                     LLVMValueRef v_psl, LLVMValueRef cc)
+{
+    LLVMValueRef old  = LLVMBuildLoad2(b, i32, v_psl, "po");
+    LLVMValueRef mask = LLVMConstInt(i32, 0xFFFFFFF1u, 0);  /* keep bit 0 (C) */
     LLVMBuildStore(b, LLVMBuildOr(b,
                        LLVMBuildAnd(b, old, mask, "pm"),
                        cc, "pn"), v_psl);
@@ -406,7 +417,7 @@ static int compile_tstl(void)
 
     LLVMValueRef src = build_resolve(b, i32, LLVMGetParam(fn, 0),
                                       LLVMGetParam(fn, 2), LLVMGetParam(fn, 3));
-    build_psl_update(b, i32, LLVMGetParam(fn, 1),
+    build_psl_update_logical(b, i32, LLVMGetParam(fn, 1),
                      build_cc_logical(b, i32, src, 0xFFFFFFFFu, 0x80000000u));
     LLVMBuildRetVoid(b);
     LLVMDisposeBuilder(b);
@@ -452,6 +463,8 @@ static int compile_tstl(void)
 #define VAX_OPC_PUSHL  0xDD
 #define VAX_OPC_MOVAL  0xDE
 #define VAX_OPC_PUSHAL 0xDF
+#define VAX_OPC_PUSHR  0xBB
+#define VAX_OPC_MOVPSL 0xDC
 
 /* ------------------------------------------------------------------ */
 /* Register shadow: tracks loaded/modified register values             */
@@ -710,7 +723,7 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
         result  = LLVMBuildOr(b, dst_old, src, "r");
         cc      = build_cc_logical(b, i32, result, 0xFFFFFFFFu, 0x80000000u);
         emit_write_operand(b, i32, &insn->ops[1], ea1, result, s, regs, mem);
-        build_psl_update(b, i32, v_psl, cc);
+        build_psl_update_logical(b, i32, v_psl, cc);
         return;
 
     /* BISL3 src1, src2, dst  :  dst = src2 | src1 */
@@ -724,7 +737,7 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
         result = LLVMBuildOr(b, src2, src, "r");
         cc     = build_cc_logical(b, i32, result, 0xFFFFFFFFu, 0x80000000u);
         emit_write_operand(b, i32, &insn->ops[2], ea2, result, s, regs, mem);
-        build_psl_update(b, i32, v_psl, cc);
+        build_psl_update_logical(b, i32, v_psl, cc);
         return;
     }
 
@@ -737,7 +750,7 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
         result  = LLVMBuildAnd(b, dst_old, LLVMBuildNot(b, src, "ns"), "r");
         cc      = build_cc_logical(b, i32, result, 0xFFFFFFFFu, 0x80000000u);
         emit_write_operand(b, i32, &insn->ops[1], ea1, result, s, regs, mem);
-        build_psl_update(b, i32, v_psl, cc);
+        build_psl_update_logical(b, i32, v_psl, cc);
         return;
 
     /* BICL3 src1, src2, dst  :  dst = src2 & ~src1 */
@@ -751,7 +764,7 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
         result = LLVMBuildAnd(b, src2, LLVMBuildNot(b, src, "ns"), "r");
         cc     = build_cc_logical(b, i32, result, 0xFFFFFFFFu, 0x80000000u);
         emit_write_operand(b, i32, &insn->ops[2], ea2, result, s, regs, mem);
-        build_psl_update(b, i32, v_psl, cc);
+        build_psl_update_logical(b, i32, v_psl, cc);
         return;
     }
 
@@ -764,7 +777,7 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
         result  = LLVMBuildXor(b, dst_old, src, "r");
         cc      = build_cc_logical(b, i32, result, 0xFFFFFFFFu, 0x80000000u);
         emit_write_operand(b, i32, &insn->ops[1], ea1, result, s, regs, mem);
-        build_psl_update(b, i32, v_psl, cc);
+        build_psl_update_logical(b, i32, v_psl, cc);
         return;
 
     /* XORL3 src1, src2, dst  :  dst = src2 ^ src1 */
@@ -778,7 +791,7 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
         result = LLVMBuildXor(b, src2, src, "r");
         cc     = build_cc_logical(b, i32, result, 0xFFFFFFFFu, 0x80000000u);
         emit_write_operand(b, i32, &insn->ops[2], ea2, result, s, regs, mem);
-        build_psl_update(b, i32, v_psl, cc);
+        build_psl_update_logical(b, i32, v_psl, cc);
         return;
     }
 
@@ -789,7 +802,7 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
         src    = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
         cc     = build_cc_logical(b, i32, src, 0xFFFFFFFFu, 0x80000000u);
         emit_write_operand(b, i32, &insn->ops[1], ea1, src, s, regs, mem);
-        build_psl_update(b, i32, v_psl, cc);
+        build_psl_update_logical(b, i32, v_psl, cc);
         return;
 
     /* MCOML src, dst  :  dst = ~src */
@@ -800,7 +813,7 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
         result = LLVMBuildNot(b, src, "r");
         cc     = build_cc_logical(b, i32, result, 0xFFFFFFFFu, 0x80000000u);
         emit_write_operand(b, i32, &insn->ops[1], ea1, result, s, regs, mem);
-        build_psl_update(b, i32, v_psl, cc);
+        build_psl_update_logical(b, i32, v_psl, cc);
         return;
 
     /* CMPL src1, src2  :  src1 - src2, set CC, no store */
@@ -819,7 +832,7 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
         ea0 = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
         src = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
         cc  = build_cc_logical(b, i32, src, 0xFFFFFFFFu, 0x80000000u);
-        build_psl_update(b, i32, v_psl, cc);
+        build_psl_update_logical(b, i32, v_psl, cc);
         return;
 
     /* CLRL dst  :  dst = 0 */
@@ -828,7 +841,7 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
         result = LLVMConstInt(i32, 0, 0);
         cc     = build_cc_logical(b, i32, result, 0xFFFFFFFFu, 0x80000000u);
         emit_write_operand(b, i32, &insn->ops[0], ea0, result, s, regs, mem);
-        build_psl_update(b, i32, v_psl, cc);
+        build_psl_update_logical(b, i32, v_psl, cc);
         return;
 
     /* INCL dst  :  dst = dst + 1 */
@@ -860,7 +873,7 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
         src = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
         cc  = build_cc_logical(b, i32, src, 0xFFu, 0x80u);
         emit_write_operand(b, i32, &insn->ops[1], ea1, src, s, regs, mem);
-        build_psl_update(b, i32, v_psl, cc);
+        build_psl_update_logical(b, i32, v_psl, cc);
         return;
 
     /* MOVW src, dst  :  dst[15:0] = src[15:0], CC on word */
@@ -870,7 +883,7 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
         src = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
         cc  = build_cc_logical(b, i32, src, 0xFFFFu, 0x8000u);
         emit_write_operand(b, i32, &insn->ops[1], ea1, src, s, regs, mem);
-        build_psl_update(b, i32, v_psl, cc);
+        build_psl_update_logical(b, i32, v_psl, cc);
         return;
 
     /* MOVZBL src, dst  :  dst = zero_extend(src[7:0]), CC on longword */
@@ -880,7 +893,7 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
         src = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
         cc  = build_cc_logical(b, i32, src, 0xFFFFFFFFu, 0x80000000u);
         emit_write_operand(b, i32, &insn->ops[1], ea1, src, s, regs, mem);
-        build_psl_update(b, i32, v_psl, cc);
+        build_psl_update_logical(b, i32, v_psl, cc);
         return;
 
     /* MOVZWL src, dst  :  dst = zero_extend(src[15:0]), CC on longword */
@@ -890,7 +903,7 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
         src = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
         cc  = build_cc_logical(b, i32, src, 0xFFFFFFFFu, 0x80000000u);
         emit_write_operand(b, i32, &insn->ops[1], ea1, src, s, regs, mem);
-        build_psl_update(b, i32, v_psl, cc);
+        build_psl_update_logical(b, i32, v_psl, cc);
         return;
 
     /* PUSHL src  :  *(--SP) = src, CC on longword */
@@ -903,7 +916,7 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
         shadow_set(s, 14, sp_new);
         emit_mem_store(b, i32, mem, sp_new, src, 4);
         cc = build_cc_logical(b, i32, src, 0xFFFFFFFFu, 0x80000000u);
-        build_psl_update(b, i32, v_psl, cc);
+        build_psl_update_logical(b, i32, v_psl, cc);
         return;
     }
 
@@ -1012,7 +1025,7 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
         ea1 = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
         emit_write_operand(b, i32, &insn->ops[1], ea1, ea, s, regs, mem);
         cc = build_cc_logical(b, i32, ea, 0xFFFFFFFFu, 0x80000000u);
-        build_psl_update(b, i32, v_psl, cc);
+        build_psl_update_logical(b, i32, v_psl, cc);
         return;
     }
 
@@ -1026,7 +1039,36 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
         shadow_set(s, 14, sp_new);
         emit_mem_store(b, i32, mem, sp_new, ea, 4);
         cc = build_cc_logical(b, i32, ea, 0xFFFFFFFFu, 0x80000000u);
-        build_psl_update(b, i32, v_psl, cc);
+        build_psl_update_logical(b, i32, v_psl, cc);
+        return;
+    }
+
+    /* PUSHR mask.rw — push selected registers R14..R0 onto stack.
+       mask is always a compile-time constant (scan rejects register mode). */
+    case VAX_OPC_PUSHR: {
+        LLVMValueRef mask_val = emit_read_operand(b, i32, &insn->ops[0], NULL,
+                                                  s, regs, mem);
+        uint32_t mask = (uint32_t)LLVMConstIntGetZExtValue(mask_val) & 0x7FFF;
+        LLVMValueRef sp = shadow_get(b, i32, s, 14, regs);
+        int ri;
+        for (ri = 14; ri >= 0; ri--) {
+            if (mask & (1u << ri)) {
+                sp = LLVMBuildSub(b, sp, LLVMConstInt(i32, 4, 0), "sp");
+                LLVMValueRef rv = shadow_get(b, i32, s, ri, regs);
+                emit_mem_store(b, i32, mem, sp, rv, 4);
+            }
+        }
+        shadow_set(s, 14, sp);  /* update SP in shadow */
+        /* PUSHR does not set CC */
+        return;
+    }
+
+    /* MOVPSL dst.wl — copy current PSL (including CC bits) to destination. */
+    case VAX_OPC_MOVPSL: {
+        ea0    = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        result = LLVMBuildLoad2(b, i32, v_psl, "psl");
+        emit_write_operand(b, i32, &insn->ops[0], ea0, result, s, regs, mem);
+        /* MOVPSL does not alter CC */
         return;
     }
 

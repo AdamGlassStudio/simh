@@ -712,6 +712,11 @@ for ( ;; ) {
        for the first instruction the scanner could not handle.           */
     if (vax_jit_enabled) {
         VaxJITBlock blk;
+        /* Flush interpreter's cc accumulator into PSL so the JIT sees the
+           correct combined PSL (including CC bits from the last interpreter insn).
+           Also sync cc back from PSL after the block so the interpreter resumes
+           with correct CC state. */
+        PSL = (PSL & ~0xF) | (cc & 0xF);
         vax_jit_scan_block(PC, &blk, (int32_t *)M);
         if (blk.n_insns > 0) {
             if (vax_jit_llvm_exec_block(&blk, R, &PSL,
@@ -725,6 +730,8 @@ for ( ;; ) {
                 ibufl = ibufh = 0;
                 ibcnt = 0;
                 ppc   = PC;
+                /* Sync cc from PSL so the interpreter resumes with correct CC */
+                cc = PSL & 0xF;
                 /* Telemetry */
                 vax_jit_stats.blocks_run++;
                 vax_jit_stats.insns_jit += (uint64_t)blk.n_insns;

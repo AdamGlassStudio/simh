@@ -387,7 +387,8 @@ static int always_block_path(int32 opc)
         || opc == ASHL || opc == MOVQ
         || opc == MOVAB || opc == MOVAL || opc == PUSHAB || opc == PUSHAL
         || opc == ADDL3 || opc == SUBL3
-        || opc == BISL3 || opc == BICL3 || opc == XORL3;
+        || opc == BISL3 || opc == BICL3 || opc == XORL3
+        || opc == PUSHR || opc == MOVPSL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -419,6 +420,7 @@ static uint8_t vax_jit_scan_op_lnt(int32_t opc, int op_idx)
     switch (opc) {
     case MOVB:   return 1;
     case MOVW:   return 2;
+    case PUSHR:  return 2;   /* mask is a word */
     case MOVZBL: return (op_idx == 0) ? 1 : 4;
     case MOVZWL: return (op_idx == 0) ? 2 : 4;
     case ASHL:   return (op_idx == 0) ? 1 : 4;
@@ -535,6 +537,13 @@ void vax_jit_scan_block(int32_t start_pc, VaxJITBlock *blk, int32_t *mem)
             insn.ops[i] = to_blk_op(&op, op_lnt);
         }
 
+        /* PUSHR: mask must be a compile-time constant (literal or immediate).
+           A register-mode mask requires a runtime loop we don't generate. */
+        if (ok && opc == PUSHR && insn.ops[0].kind == JITBLK_REGISTER) {
+            if (first_stop_opc < 0) first_stop_opc = opc;
+            ok = 0;
+        }
+
         if (!ok)
             break;
 
@@ -569,6 +578,9 @@ int vax_jit_noperands(int32 opc)
     case ASHL: case MOVQ:
     case MOVAB: case MOVAL:
     case PUSHAB: case PUSHAL:
+        return DR_GETNSP(drom[opc][0]);
+    case PUSHR:
+    case MOVPSL:
         return DR_GETNSP(drom[opc][0]);
     default:
         return -1;
