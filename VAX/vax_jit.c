@@ -66,6 +66,15 @@ void vax_jit_stats_reset(void)
     memset(&vax_jit_stats, 0, sizeof vax_jit_stats);
 }
 
+/* Opcode name table for the 0x00-0xFF single-byte range (common ones) */
+static const char *vax_opc_name(int opc)
+{
+    extern char const * const opcode[];
+    if (opc >= 0 && opc < 256 && opcode[opc])
+        return opcode[opc];
+    return NULL;
+}
+
 t_stat vax_jit_stats_show(FILE *st, UNIT *uptr, int32 val, CONST void *desc)
 {
     uint64_t total = vax_jit_stats.insns_jit + vax_jit_stats.insns_interp;
@@ -99,6 +108,40 @@ t_stat vax_jit_stats_show(FILE *st, UNIT *uptr, int32 val, CONST void *desc)
             if (vax_jit_stats.size_hist[i])
                 fprintf(st, "    %2d insns: %u blocks\n",
                         i, vax_jit_stats.size_hist[i]);
+        }
+    }
+
+    /* Print top scan_empty blocking opcodes (sorted by count, top 16) */
+    {
+        int any = 0;
+        for (i = 0; i < 256; i++)
+            if (vax_jit_stats.scan_empty_opc[i]) { any = 1; break; }
+        if (any) {
+            /* simple selection sort for top 16 */
+            int order[256], n = 0;
+            for (i = 0; i < 256; i++)
+                if (vax_jit_stats.scan_empty_opc[i]) order[n++] = i;
+            /* bubble top entries to front */
+            int j;
+            for (i = 0; i < n && i < 16; i++) {
+                int best = i;
+                for (j = i+1; j < n; j++)
+                    if (vax_jit_stats.scan_empty_opc[order[j]] >
+                        vax_jit_stats.scan_empty_opc[order[best]])
+                        best = j;
+                int tmp = order[i]; order[i] = order[best]; order[best] = tmp;
+            }
+            fprintf(st, "  Top blocking opcodes (scan_empty cause):\n");
+            for (i = 0; i < n && i < 16; i++) {
+                int opc = order[i];
+                const char *nm = vax_opc_name(opc);
+                if (nm)
+                    fprintf(st, "    0x%02X %-10s %u\n", opc, nm,
+                            vax_jit_stats.scan_empty_opc[opc]);
+                else
+                    fprintf(st, "    0x%02X %-10s %u\n", opc, "?",
+                            vax_jit_stats.scan_empty_opc[opc]);
+            }
         }
     }
     return SCPE_OK;
@@ -432,6 +475,7 @@ void vax_jit_scan_block(int32_t start_pc, VaxJITBlock *blk, int32_t *mem)
 {
     int32_t pc = start_pc;
     int i;
+    int32_t first_stop_opc = -1;   /* opcode that terminated scan (for telemetry) */
     blk->n_insns        = 0;
     blk->fallthrough_pc = start_pc;
 
@@ -446,13 +490,17 @@ void vax_jit_scan_block(int32_t start_pc, VaxJITBlock *blk, int32_t *mem)
         }
 
         /* Stop before any branch/call/return */
-        if (is_branch_opc(opc))
+        if (is_branch_opc(opc)) {
+            if (first_stop_opc < 0) first_stop_opc = opc;
             break;
+        }
 
         /* Stop if opcode is not JIT-handled */
         int nops = vax_jit_noperands(opc);
-        if (nops < 0)
+        if (nops < 0) {
+            if (first_stop_opc < 0) first_stop_opc = opc;
             break;
+        }
 
         /* Decode operands */
         VaxJITBlkInsn insn;
@@ -467,7 +515,7 @@ void vax_jit_scan_block(int32_t start_pc, VaxJITBlock *blk, int32_t *mem)
             int     ext_lnt = vax_jit_spec_ext_lnt(spec, (int32)op_lnt);
 
             /* Can't represent ext_lnt > 4 in a single int32_t follow value */
-            if (ext_lnt > 4) { ok = 0; break; }
+            if (ext_lnt > 4) { ok = 0; if (first_stop_opc < 0) first_stop_opc = opc; break; }
 
             int32_t follow = 0;
             if (ext_lnt == 1)
@@ -482,7 +530,7 @@ void vax_jit_scan_block(int32_t start_pc, VaxJITBlock *blk, int32_t *mem)
 
             VaxJITOperand op;
             vax_jit_decode_operand(spec, follow, pc_after, &op);
-            if (op.kind == JITOPK_UNSUPPORTED) { ok = 0; break; }
+            if (op.kind == JITOPK_UNSUPPORTED) { ok = 0; if (first_stop_opc < 0) first_stop_opc = opc; break; }
 
             insn.ops[i] = to_blk_op(&op, op_lnt);
         }
@@ -493,6 +541,10 @@ void vax_jit_scan_block(int32_t start_pc, VaxJITBlock *blk, int32_t *mem)
         blk->insns[blk->n_insns++] = insn;
         blk->fallthrough_pc = pc;
     }
+
+    /* Record the blocking opcode when the very first instruction was rejected */
+    if (blk->n_insns == 0 && first_stop_opc >= 0 && first_stop_opc < 256)
+        vax_jit_stats.scan_empty_opc[first_stop_opc]++;
 }
 
 /* ------------------------------------------------------------------ */

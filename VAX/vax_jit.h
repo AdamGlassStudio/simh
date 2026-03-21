@@ -115,12 +115,13 @@ int  vax_jit_llvm_exec_block (VaxJITBlock *blk, int32_t *regs,
    JIT telemetry: counters updated by vax_cpu.c, read by SHOW CPU JITSTATS
    ------------------------------------------------------------------ */
 typedef struct {
-    uint64_t blocks_run;       /* JIT blocks executed successfully        */
-    uint64_t insns_jit;        /* instructions executed via JIT           */
-    uint64_t insns_interp;     /* instructions executed via interpreter   */
-    uint64_t scan_empty;       /* scanner found 0 JIT-able instructions   */
-    uint64_t compile_fail;     /* compile_block returned NULL             */
-    uint32_t size_hist[33];    /* size_hist[n]: blocks of exactly n insns */
+    uint64_t blocks_run;           /* JIT blocks executed successfully        */
+    uint64_t insns_jit;            /* instructions executed via JIT           */
+    uint64_t insns_interp;         /* instructions executed via interpreter   */
+    uint64_t scan_empty;           /* scanner found 0 JIT-able instructions   */
+    uint64_t compile_fail;         /* compile_block returned NULL             */
+    uint32_t size_hist[33];        /* size_hist[n]: blocks of exactly n insns */
+    uint32_t scan_empty_opc[256];  /* scan_empty_opc[opc]: times opc was first non-JIT insn */
 } VaxJITStats;
 
 extern VaxJITStats vax_jit_stats;
