@@ -111,6 +111,29 @@ void vax_jit_scan_block (int32_t start_pc, VaxJITBlock *blk, int32_t *mem);
 int  vax_jit_llvm_exec_block (VaxJITBlock *blk, int32_t *regs,
                                int32_t *psl, int32_t *mem);
 
+/* ------------------------------------------------------------------
+   JIT telemetry: counters updated by vax_cpu.c, read by SHOW CPU JITSTATS
+   ------------------------------------------------------------------ */
+typedef struct {
+    uint64_t blocks_run;       /* JIT blocks executed successfully        */
+    uint64_t insns_jit;        /* instructions executed via JIT           */
+    uint64_t insns_interp;     /* instructions executed via interpreter   */
+    uint64_t scan_empty;       /* scanner found 0 JIT-able instructions   */
+    uint64_t compile_fail;     /* compile_block returned NULL             */
+    uint32_t size_hist[33];    /* size_hist[n]: blocks of exactly n insns */
+} VaxJITStats;
+
+extern VaxJITStats vax_jit_stats;
+
+/* Reset all counters to zero. */
+void vax_jit_stats_reset (void);
+
+/* Print a formatted stats report to st. */
+t_stat vax_jit_stats_show (FILE *st, UNIT *uptr, int32 val, CONST void *desc);
+
+/* SIMH SET handler: SET CPU JITSTATS=RESET clears counters. */
+t_stat vax_jit_stats_set  (UNIT *uptr, int32 val, CONST char *cptr, void *desc);
+
 /* Initialise / shut down the LLVM ORC JIT engine.                       */
 int  vax_jit_init    (void);
 void vax_jit_destroy (void);

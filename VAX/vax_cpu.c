@@ -404,6 +404,8 @@ MTAB cpu_mod[] = {
     { UNIT_JIT, UNIT_JIT, "JIT enabled",  "JIT",      NULL, NULL, NULL, "Enable JIT accelerator" },
     { UNIT_JITDUMP, 0,           "JIT IR dump disabled", "NOJITDUMP", &cpu_set_jitdump, NULL, NULL, "Disable JIT IR dump" },
     { UNIT_JITDUMP, UNIT_JITDUMP,"JIT IR dump enabled",  "JITDUMP",   &cpu_set_jitdump, NULL, NULL, "Dump LLVM IR for each compiled handler to stderr" },
+    { MTAB_XTD|MTAB_VDV|MTAB_NMO, 0, "JITSTATS", "JITSTATS",
+      &vax_jit_stats_set, &vax_jit_stats_show, NULL, "Show/reset JIT telemetry counters" },
     { MTAB_XTD|MTAB_VDV, 0, "IDLE", "IDLE{=VMS|ULTRIX|ULTRIX-1.X|ULTRIXOLD|NETBSD|NETBSDOLD|OPENBSD|OPENBSDOLD|QUASIJARUS|32V|ELN|MDM|INFOSERVER}{:n}", &cpu_set_idle, &cpu_show_idle, NULL, "Display idle detection mode" },
     { MTAB_XTD|MTAB_VDV, 0, NULL, "NOIDLE", &sim_clr_idle, NULL, NULL,  "Disables idle detection" },
     MEM_MODIFIERS,   /* Model specific memory modifiers from vaxXXX_defs.h */
@@ -723,11 +725,20 @@ for ( ;; ) {
                 ibufl = ibufh = 0;
                 ibcnt = 0;
                 ppc   = PC;
+                /* Telemetry */
+                vax_jit_stats.blocks_run++;
+                vax_jit_stats.insns_jit += (uint64_t)blk.n_insns;
+                vax_jit_stats.size_hist[blk.n_insns < 33 ? blk.n_insns : 32]++;
                 continue;
+            } else {
+                vax_jit_stats.compile_fail++;
             }
+        } else {
+            vax_jit_stats.scan_empty++;
         }
     }
 
+    vax_jit_stats.insns_interp++;                       /* interpreter path */
     sim_interval = sim_interval - (1 + (extra_bytes>>5));/* count instr */
     extra_bytes = 0;                                    /* digest string count */
     GET_ISTR (opc, L_BYTE);                             /* get opcode */

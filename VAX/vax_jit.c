@@ -11,6 +11,7 @@
 
 #include "vax_jit.h"
 #include <stdint.h>
+#include <string.h>
 
 /* vax_defs.h defines R and PSL as compat macros pointing to cpu_state.
    Undefine them here so we can access struct members via a pointer
@@ -53,6 +54,64 @@ int  vax_jit_llvm_exec_block (VaxJITBlock *blk, int32_t *regs,
 
 int vax_jit_enabled = 0;
 int vax_jit_ir_dump = 0;
+
+/* ------------------------------------------------------------------ */
+/* Telemetry                                                            */
+/* ------------------------------------------------------------------ */
+
+VaxJITStats vax_jit_stats;
+
+void vax_jit_stats_reset(void)
+{
+    memset(&vax_jit_stats, 0, sizeof vax_jit_stats);
+}
+
+t_stat vax_jit_stats_show(FILE *st, UNIT *uptr, int32 val, CONST void *desc)
+{
+    uint64_t total = vax_jit_stats.insns_jit + vax_jit_stats.insns_interp;
+    double jit_pct = total ? 100.0 * vax_jit_stats.insns_jit / total : 0.0;
+    int i;
+
+    fprintf(st, "JIT statistics:\n");
+    fprintf(st, "  Blocks run:         %llu\n",
+            (unsigned long long)vax_jit_stats.blocks_run);
+    fprintf(st, "  Insns via JIT:      %llu (%.1f%%)\n",
+            (unsigned long long)vax_jit_stats.insns_jit, jit_pct);
+    fprintf(st, "  Insns interpreter:  %llu\n",
+            (unsigned long long)vax_jit_stats.insns_interp);
+    fprintf(st, "  Scanner returned 0: %llu\n",
+            (unsigned long long)vax_jit_stats.scan_empty);
+    fprintf(st, "  Compile failures:   %llu\n",
+            (unsigned long long)vax_jit_stats.compile_fail);
+
+    if (vax_jit_stats.blocks_run > 0) {
+        double avg = (double)vax_jit_stats.insns_jit / vax_jit_stats.blocks_run;
+        uint32_t mn = 33, mx = 0;
+        for (i = 1; i <= 32; i++) {
+            if (vax_jit_stats.size_hist[i]) {
+                if ((uint32_t)i < mn) mn = i;
+                if ((uint32_t)i > mx) mx = i;
+            }
+        }
+        fprintf(st, "  Block size avg/min/max: %.2f / %u / %u\n", avg, mn, mx);
+        fprintf(st, "  Block size distribution:\n");
+        for (i = 1; i <= 32; i++) {
+            if (vax_jit_stats.size_hist[i])
+                fprintf(st, "    %2d insns: %u blocks\n",
+                        i, vax_jit_stats.size_hist[i]);
+        }
+    }
+    return SCPE_OK;
+}
+
+t_stat vax_jit_stats_set(UNIT *uptr, int32 val, CONST char *cptr, void *desc)
+{
+    if (cptr && strcmp(cptr, "RESET") == 0) {
+        vax_jit_stats_reset();
+        return SCPE_OK;
+    }
+    return sim_messagef(SCPE_ARG, "Usage: SET CPU JITSTATS=RESET\n");
+}
 
 int vax_jit_init(void)
 {
@@ -283,7 +342,9 @@ static int always_block_path(int32 opc)
 {
     return opc == MOVB || opc == MOVW || opc == MOVZBL || opc == MOVZWL || opc == PUSHL
         || opc == ASHL || opc == MOVQ
-        || opc == MOVAB || opc == MOVAL || opc == PUSHAB || opc == PUSHAL;
+        || opc == MOVAB || opc == MOVAL || opc == PUSHAB || opc == PUSHAL
+        || opc == ADDL3 || opc == SUBL3
+        || opc == BISL3 || opc == BICL3 || opc == XORL3;
 }
 
 /* ------------------------------------------------------------------ */
@@ -446,6 +507,9 @@ int vax_jit_noperands(int32 opc)
     case BISL2: case BICL2: case XORL2:
     case MOVL:  case CMPL:  case MCOML:
     case CLRL:  case TSTL:  case INCL:  case DECL:
+        return DR_GETNSP(drom[opc][0]);
+    case ADDL3: case SUBL3:
+    case BISL3: case BICL3: case XORL3:
         return DR_GETNSP(drom[opc][0]);
     case MOVB: case MOVW:
     case MOVZBL: case MOVZWL:
