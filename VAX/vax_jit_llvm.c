@@ -1077,46 +1077,370 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Branch condition: emit i1 from PSL for VAX conditional branches     */
+/* PSL CC layout: bit3=N, bit2=Z, bit1=V, bit0=C                      */
+/* ------------------------------------------------------------------ */
+
+/* Extract one CC bit from PSL as i1 (reloads PSL each call). */
+static LLVMValueRef emit_psl_bit(LLVMBuilderRef b, LLVMTypeRef i32,
+                                  LLVMValueRef psl_val, int bit)
+{
+    LLVMContextRef lctx = LLVMGetTypeContext(i32);
+    LLVMTypeRef i1  = LLVMInt1TypeInContext(lctx);
+    LLVMValueRef sh = LLVMBuildLShr(b, psl_val,
+                                     LLVMConstInt(i32, (unsigned)bit, 0), "ps");
+    LLVMValueRef and = LLVMBuildAnd(b, sh, LLVMConstInt(i32, 1, 0), "pb");
+    return LLVMBuildTrunc(b, and, i1, "bt");
+}
+
+/* Build an i1 condition value from the current PSL for the given VaxBCond. */
+static LLVMValueRef emit_branch_cond(LLVMBuilderRef b, LLVMTypeRef i32,
+                                      LLVMValueRef v_psl, int cond)
+{
+    LLVMValueRef psl_val = LLVMBuildLoad2(b, i32, v_psl, "psl");
+    LLVMValueRef n = emit_psl_bit(b, i32, psl_val, 3);
+    LLVMValueRef z = emit_psl_bit(b, i32, psl_val, 2);
+    LLVMValueRef v = emit_psl_bit(b, i32, psl_val, 1);
+    LLVMValueRef c = emit_psl_bit(b, i32, psl_val, 0);
+
+    switch (cond) {
+    case VAX_BCOND_NEQ:  return LLVMBuildNot(b, z, "");                         /* !Z */
+    case VAX_BCOND_EQL:  return z;                                               /* Z  */
+    case VAX_BCOND_GEQ:  return LLVMBuildICmp(b, LLVMIntEQ,  n, v, "");        /* N=V */
+    case VAX_BCOND_LSS:  return LLVMBuildICmp(b, LLVMIntNE,  n, v, "");        /* N!=V */
+    case VAX_BCOND_GTR: {                                                        /* !Z && N=V */
+        LLVMValueRef nv_eq = LLVMBuildICmp(b, LLVMIntEQ, n, v, "nveq");
+        return LLVMBuildAnd(b, LLVMBuildNot(b, z, "nz"), nv_eq, "");
+    }
+    case VAX_BCOND_LEQ: {                                                        /* Z || N!=V */
+        LLVMValueRef nv_ne = LLVMBuildICmp(b, LLVMIntNE, n, v, "nvne");
+        return LLVMBuildOr(b, z, nv_ne, "");
+    }
+    case VAX_BCOND_GTRU: {                                                       /* !C && !Z */
+        return LLVMBuildAnd(b, LLVMBuildNot(b, c, "nc"),
+                                LLVMBuildNot(b, z, "nz"), "");
+    }
+    case VAX_BCOND_LEQU: return LLVMBuildOr(b, c, z, "");                       /* C || Z */
+    case VAX_BCOND_VC:   return LLVMBuildNot(b, v, "");                         /* !V */
+    case VAX_BCOND_VS:   return v;                                               /* V  */
+    case VAX_BCOND_GEQU: return LLVMBuildNot(b, c, "");                         /* !C */
+    case VAX_BCOND_LSSU: return c;                                               /* C  */
+    default:             return LLVMConstInt(LLVMInt1TypeInContext(LLVMGetTypeContext(i32)), 1, 0);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* BB map: (guest_pc -> LLVMBasicBlockRef)                             */
+/* ------------------------------------------------------------------ */
+
+#define MAX_BB_ENTRIES (VAX_JIT_MAX_INSNS * 3)
+
+typedef struct { int32_t pc; LLVMBasicBlockRef bb; } BBEntry;
+
+static LLVMBasicBlockRef bb_map_lookup(BBEntry *map, int n, int32_t pc)
+{
+    int i;
+    for (i = 0; i < n; i++)
+        if (map[i].pc == pc) return map[i].bb;
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Shadow clear helper                                                  */
+/* ------------------------------------------------------------------ */
+
+static void shadow_clear(RegShadow *s)
+{
+    int i;
+    for (i = 0; i < 16; i++) s->val[i] = NULL;
+}
+
+/* Write a constant PC value into the regs[15] slot directly (no shadow). */
+static void emit_pc_store(LLVMBuilderRef b, LLVMTypeRef i32,
+                           LLVMValueRef v_regs, int32_t pc_val)
+{
+    LLVMValueRef idx = LLVMConstInt(i32, 15, 0);
+    LLVMValueRef ptr = LLVMBuildGEP2(b, i32, v_regs, &idx, 1, "");
+    LLVMBuildStore(b, LLVMConstInt(i32, (uint32_t)pc_val, 0), ptr);
+}
+
+/* Decrement *sim_interval by delta; store back. */
+static void emit_sim_interval_dec(LLVMBuilderRef b, LLVMTypeRef i32,
+                                   LLVMValueRef v_siv, int delta)
+{
+    LLVMValueRef old  = LLVMBuildLoad2(b, i32, v_siv, "siv");
+    LLVMValueRef nval = LLVMBuildSub(b, old, LLVMConstInt(i32, (unsigned)delta, 0), "sivn");
+    LLVMBuildStore(b, nval, v_siv);
+}
+
 /* Compile all instructions in the block to a single native function.
-   Uses a shared RegShadow across all instructions — no inter-instruction
-   flush.  Writes blk->fallthrough_pc into regs[15] before the final spill.
+   Supports multi-BB regions: intra-block branches become LLVM br
+   instructions.  Back-edges check sim_interval and exit if <= 0.
+   Writes the appropriate guest PC into regs[15] at every exit point.
    Returns NULL on error.                                               */
-static void *compile_block(VaxJITBlock *blk)
+static void *compile_block(VaxJITBlock *blk, int32_t *sim_interval_ptr)
 {
     static uint32_t bcnt = 0;
     char sym[32];
+    int i;
     int32_t first_opc = blk->n_insns > 0 ? blk->insns[0].opc : 0;
     snprintf(sym, sizeof(sym), "blk_%02x_%u", (uint32_t)(uint8_t)first_opc, bcnt++);
 
     LLVMTypeRef i32  = LLVMInt32TypeInContext(ctx);
     LLVMTypeRef ptr  = LLVMPointerTypeInContext(ctx, 0);
-    LLVMTypeRef ps[3] = { ptr, ptr, ptr };
+    /* Function: void(ptr regs, ptr psl, ptr mem, ptr sim_interval) */
+    LLVMTypeRef ps[4] = { ptr, ptr, ptr, ptr };
     LLVMModuleRef mod = LLVMModuleCreateWithNameInContext(sym, ctx);
     LLVMValueRef  fn  = LLVMAddFunction(mod, sym,
                             LLVMFunctionType(LLVMVoidTypeInContext(ctx),
-                                             ps, 3, 0));
+                                             ps, 4, 0));
     LLVMBuilderRef b  = LLVMCreateBuilderInContext(ctx);
-    LLVMPositionBuilderAtEnd(b,
-        LLVMAppendBasicBlockInContext(ctx, fn, "entry"));
 
     LLVMValueRef v_regs = LLVMGetParam(fn, 0);
     LLVMValueRef v_psl  = LLVMGetParam(fn, 1);
     LLVMValueRef v_mem  = LLVMGetParam(fn, 2);
+    LLVMValueRef v_siv  = LLVMGetParam(fn, 3);
 
-    RegShadow shadow;
-    int i;
-    for (i = 0; i < 16; i++) shadow.val[i] = NULL;
+    /* ---- Pre-pass: build BB map ---- */
 
-    /* Emit all instructions with a single shared shadow */
+    /* Collect all insn_pcs for membership test */
+    int32_t insn_pcs[VAX_JIT_MAX_INSNS];
     for (i = 0; i < blk->n_insns; i++)
-        emit_insn(b, i32, &blk->insns[i], &shadow, v_regs, v_psl, v_mem);
+        insn_pcs[i] = blk->insns[i].insn_pc;
 
-    /* Write the fall-through PC into the shadow before spilling */
-    shadow_set(&shadow, 15,
-               LLVMConstInt(i32, (uint32_t)blk->fallthrough_pc, 0));
+    /* Determine which PCs need their own LLVM basic block */
+    int32_t  bb_start_pcs[MAX_BB_ENTRIES];
+    int      n_bb_starts = 0;
 
-    shadow_spill(b, i32, &shadow, v_regs);
+    /* First instruction always starts the entry BB */
+    if (blk->n_insns > 0)
+        bb_start_pcs[n_bb_starts++] = insn_pcs[0];
+
+    for (i = 0; i < blk->n_insns; i++) {
+        VaxJITBlkInsn *insn = &blk->insns[i];
+        if (insn->branch_target < 0) continue;
+
+        int32_t tgt = insn->branch_target;
+        int is_uncond = (insn->branch_cond == VAX_BCOND_UNCOND);
+        int j, found;
+
+        /* Check if target is an intra-region instruction */
+        int tgt_intra = 0;
+        for (j = 0; j < blk->n_insns; j++)
+            if (insn_pcs[j] == tgt) { tgt_intra = 1; break; }
+
+        if (tgt_intra) {
+            /* Target needs a BB */
+            found = 0;
+            for (j = 0; j < n_bb_starts; j++)
+                if (bb_start_pcs[j] == tgt) { found = 1; break; }
+            if (!found && n_bb_starts < MAX_BB_ENTRIES)
+                bb_start_pcs[n_bb_starts++] = tgt;
+        }
+
+        /* Fall-through of a conditional branch needs a BB */
+        if (!is_uncond && i + 1 < blk->n_insns) {
+            int32_t ft = insn_pcs[i + 1];
+            found = 0;
+            for (j = 0; j < n_bb_starts; j++)
+                if (bb_start_pcs[j] == ft) { found = 1; break; }
+            if (!found && n_bb_starts < MAX_BB_ENTRIES)
+                bb_start_pcs[n_bb_starts++] = ft;
+        }
+    }
+
+    /* Create LLVM BBs for each BB-start PC */
+    BBEntry bb_map[MAX_BB_ENTRIES];
+    int n_bb_map = 0;
+    {
+        char bbname[32];
+        for (i = 0; i < n_bb_starts; i++) {
+            snprintf(bbname, sizeof(bbname), "bb_%x", (uint32_t)bb_start_pcs[i]);
+            bb_map[n_bb_map].pc = bb_start_pcs[i];
+            bb_map[n_bb_map].bb = LLVMAppendBasicBlockInContext(ctx, fn, bbname);
+            n_bb_map++;
+        }
+    }
+
+    /* Create exit BBs for each unique intra-region exit target (branch targets
+       NOT in insn_pcs — exits the region) */
+    int32_t  exit_pcs[MAX_BB_ENTRIES];
+    BBEntry  exit_map[MAX_BB_ENTRIES];
+    int      n_exits = 0;
+    for (i = 0; i < blk->n_insns; i++) {
+        VaxJITBlkInsn *insn = &blk->insns[i];
+        if (insn->branch_target < 0) continue;
+        int32_t tgt = insn->branch_target;
+        int j, tgt_intra = 0;
+        for (j = 0; j < blk->n_insns; j++)
+            if (insn_pcs[j] == tgt) { tgt_intra = 1; break; }
+        if (tgt_intra) continue;
+
+        /* Exit target: find or create exit BB */
+        int found = 0;
+        for (j = 0; j < n_exits; j++)
+            if (exit_pcs[j] == tgt) { found = 1; break; }
+        if (!found && n_exits < MAX_BB_ENTRIES) {
+            char bbname[32];
+            snprintf(bbname, sizeof(bbname), "exit_%x", (uint32_t)tgt);
+            exit_pcs[n_exits]    = tgt;
+            exit_map[n_exits].pc = tgt;
+            exit_map[n_exits].bb = LLVMAppendBasicBlockInContext(ctx, fn, bbname);
+            n_exits++;
+        }
+    }
+
+    /* If has_back_edge: create sim_expired BB */
+    LLVMBasicBlockRef sim_expired_bb = NULL;
+    if (blk->has_back_edge) {
+        sim_expired_bb = LLVMAppendBasicBlockInContext(ctx, fn, "sim_expired");
+    }
+
+    /* Final fallthrough BB (for the fall-off-end case) */
+    LLVMBasicBlockRef fallthrough_bb =
+        LLVMAppendBasicBlockInContext(ctx, fn, "fallthrough");
+
+    /* ---- Populate exit BBs ---- */
+    /* We build exit BB bodies now (they just store PC and ret), but
+       we fill them in after the main emission so the builder is free. */
+
+    /* ---- Main emission ---- */
+
+    /* bb_map[0].bb is the function entry point (first BB appended). */
+    RegShadow shadow;
+    shadow_clear(&shadow);
+    LLVMPositionBuilderAtEnd(b, (n_bb_map > 0) ? bb_map[0].bb : fallthrough_bb);
+
+    int builder_terminated = 0;
+
+    for (i = 0; i < blk->n_insns; i++) {
+        VaxJITBlkInsn *insn = &blk->insns[i];
+
+        /* Check if this instruction's PC starts a new BB (after the first) */
+        if (i > 0) {
+            LLVMBasicBlockRef target_bb = bb_map_lookup(bb_map, n_bb_map, insn->insn_pc);
+            if (target_bb != NULL) {
+                /* Terminate current BB if needed */
+                if (!builder_terminated) {
+                    shadow_spill(b, i32, &shadow, v_regs);
+                    LLVMBuildBr(b, target_bb);
+                }
+                /* Switch to new BB */
+                LLVMPositionBuilderAtEnd(b, target_bb);
+                shadow_clear(&shadow);
+                builder_terminated = 0;
+            }
+        }
+
+        if (builder_terminated) {
+            /* Dead code after unconditional branch: skip emission */
+            /* but keep looping so we can detect the next BB start */
+            continue;
+        }
+
+        if (insn->branch_target >= 0) {
+            /* Branch instruction: spill, then emit the branch */
+            shadow_spill(b, i32, &shadow, v_regs);
+            shadow_clear(&shadow);
+
+            int32_t tgt = insn->branch_target;
+            int is_uncond = (insn->branch_cond == VAX_BCOND_UNCOND);
+
+            /* Is the target intra-region? */
+            int j, tgt_intra = 0;
+            for (j = 0; j < blk->n_insns; j++)
+                if (insn_pcs[j] == tgt) { tgt_intra = 1; break; }
+
+            LLVMBasicBlockRef tgt_bb = tgt_intra
+                ? bb_map_lookup(bb_map, n_bb_map, tgt)
+                : NULL;
+
+            /* Exit BB for this target (if exit) */
+            LLVMBasicBlockRef ex_bb = NULL;
+            if (!tgt_intra) {
+                for (j = 0; j < n_exits; j++)
+                    if (exit_pcs[j] == tgt) { ex_bb = exit_map[j].bb; break; }
+            }
+
+            if (is_uncond) {
+                if (tgt_intra && tgt_bb) {
+                    if (tgt < insn->insn_pc) {
+                        /* Unconditional backward intra-region (loop back-edge):
+                           write loop-top PC for sim_expired exit, check sim_interval. */
+                        emit_pc_store(b, i32, v_regs, tgt);
+                        LLVMValueRef old_iv  = LLVMBuildLoad2(b, i32, v_siv, "siv");
+                        LLVMValueRef new_iv  = LLVMBuildSub(b, old_iv,
+                                                  LLVMConstInt(i32, (unsigned)blk->n_insns, 0),
+                                                  "sivn");
+                        LLVMBuildStore(b, new_iv, v_siv);
+                        LLVMValueRef expired = LLVMBuildICmp(b, LLVMIntSLE, new_iv,
+                                                  LLVMConstInt(i32, 0, 0), "exp");
+                        LLVMBuildCondBr(b, expired, sim_expired_bb, tgt_bb);
+                    } else {
+                        /* Unconditional forward intra-region jump (not a loop):
+                           just branch to the target BB. */
+                        LLVMBuildBr(b, tgt_bb);
+                    }
+                } else {
+                    /* Unconditional exit */
+                    LLVMBuildBr(b, ex_bb ? ex_bb : fallthrough_bb);
+                }
+                builder_terminated = 1;
+            } else {
+                /* Conditional branch */
+                LLVMValueRef cond_val = emit_branch_cond(b, i32, v_psl,
+                                                          insn->branch_cond);
+                /* Fall-through BB */
+                LLVMBasicBlockRef ft_bb = (i + 1 < blk->n_insns)
+                    ? bb_map_lookup(bb_map, n_bb_map, insn_pcs[i + 1])
+                    : fallthrough_bb;
+                if (!ft_bb) ft_bb = fallthrough_bb;
+
+                if (tgt_intra && tgt_bb) {
+                    /* Conditional intra-region: true→target, false→fall-through */
+                    LLVMBuildCondBr(b, cond_val, tgt_bb, ft_bb);
+                } else {
+                    /* Conditional exit: true→exit, false→fall-through */
+                    LLVMBuildCondBr(b, cond_val,
+                                    ex_bb ? ex_bb : fallthrough_bb,
+                                    ft_bb);
+                }
+                builder_terminated = 1;
+            }
+        } else {
+            /* Normal non-branch instruction */
+            emit_insn(b, i32, insn, &shadow, v_regs, v_psl, v_mem);
+            builder_terminated = 0;
+        }
+    }
+
+    /* Final fallthrough exit (if builder is still active) */
+    if (!builder_terminated) {
+        shadow_set(&shadow, 15,
+                   LLVMConstInt(i32, (uint32_t)blk->fallthrough_pc, 0));
+        shadow_spill(b, i32, &shadow, v_regs);
+        LLVMBuildBr(b, fallthrough_bb);
+    }
+
+    /* ---- Populate fallthrough BB ---- */
+    LLVMPositionBuilderAtEnd(b, fallthrough_bb);
     LLVMBuildRetVoid(b);
+
+    /* ---- Populate exit BBs ---- */
+    for (i = 0; i < n_exits; i++) {
+        LLVMPositionBuilderAtEnd(b, exit_map[i].bb);
+        emit_pc_store(b, i32, v_regs, exit_pcs[i]);
+        LLVMBuildRetVoid(b);
+    }
+
+    /* ---- Populate sim_expired BB ---- */
+    if (sim_expired_bb) {
+        LLVMPositionBuilderAtEnd(b, sim_expired_bb);
+        /* PC already spilled before the back-edge branch; just ret. */
+        LLVMBuildRetVoid(b);
+    }
+
     LLVMDisposeBuilder(b);
 
     LLVMErrorRef err = jit_add_module(mod);
@@ -1135,12 +1459,13 @@ static void *compile_block(VaxJITBlock *blk)
 /* ------------------------------------------------------------------ */
 
 int vax_jit_llvm_exec_block(VaxJITBlock *blk, int32_t *regs,
-                             int32_t *psl, int32_t *mem)
+                             int32_t *psl, int32_t *mem,
+                             int32_t *sim_interval)
 {
-    typedef void (*BlockFn)(int32_t *, int32_t *, int32_t *);
-    BlockFn fn = (BlockFn)compile_block(blk);
+    typedef void (*BlockFn)(int32_t *, int32_t *, int32_t *, int32_t *);
+    BlockFn fn = (BlockFn)compile_block(blk, sim_interval);
     if (!fn) return 0;
-    fn(regs, psl, mem);
+    fn(regs, psl, mem, sim_interval);
     return 1;
 }
 

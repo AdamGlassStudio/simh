@@ -50,7 +50,8 @@ int  vax_jit_llvm_cmpl    (int32_t *regs, int32_t *psl,
 int  vax_jit_llvm_tstl    (int32_t *regs, int32_t *psl,
                             int src_is_const, int32_t src_val);
 int  vax_jit_llvm_exec_block (VaxJITBlock *blk, int32_t *regs,
-                               int32_t *psl, int32_t *mem);
+                               int32_t *psl, int32_t *mem,
+                               int32_t *sim_interval);
 
 int vax_jit_enabled = 0;
 int vax_jit_ir_dump = 0;
@@ -429,7 +430,8 @@ static uint8_t vax_jit_scan_op_lnt(int32_t opc, int op_idx)
     }
 }
 
-/* Returns 1 if opc is a branch/jump/call/return that terminates a block. */
+/* Returns 1 if opc is a branch/jump/call/return that terminates a block.
+   These are hard stops — not decodeable as simple displacement branches.   */
 static int is_branch_opc(int32_t opc)
 {
     switch (opc) {
@@ -469,6 +471,84 @@ static int is_branch_opc(int32_t opc)
     }
 }
 
+/* Returns 1 for call/return/indirect that cannot be decoded as a simple
+   PC-relative displacement branch.  These always terminate the block.   */
+static int is_hard_stop_opc(int32_t opc)
+{
+    switch (opc) {
+    case 0x04: /* RET    */
+    case 0x05: /* RSB    */
+    case 0x10: /* BSBB   */
+    case 0x16: /* JSB    */
+    case 0x17: /* JMP    */
+    case 0x30: /* BSBW   */
+    case 0xE0: /* BBS    */
+    case 0xE1: /* BBC    */
+    case 0xE2: /* BBSS   */
+    case 0xE3: /* BBCS   */
+    case 0xE4: /* BBSC   */
+    case 0xE5: /* BBCC   */
+    case 0xE8: /* BLBS   */
+    case 0xE9: /* BLBC   */
+    case 0xFA: /* CALLG  */
+    case 0xFB: /* CALLS  */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Returns 1 for BRB, BRW, and conditional branches — all use a simple
+   PC-relative displacement and can be decoded to a target PC.            */
+static int is_decodeable_branch_opc(int32_t opc)
+{
+    if (opc == 0x11 || opc == 0x31) return 1;        /* BRB, BRW      */
+    if (opc >= 0x12 && opc <= 0x1F) return 1;        /* cond branches */
+    return 0;
+}
+
+/* Decode the displacement of a decodeable branch opcode.
+   pc  = address of the first byte after the opcode byte.
+   Advances *pc_inout past the displacement bytes.
+   Sets *cond_out to the branch condition (VAX_BCOND_*).
+   Returns the target guest PC.                                           */
+static int32_t decode_branch_target(int32_t opc, int32_t *pc_inout,
+                                     int32_t *mem, uint8_t *cond_out)
+{
+    int32_t pc = *pc_inout;
+    int32_t target;
+
+    if (opc == 0x31) { /* BRW: 2-byte signed displacement */
+        int32_t disp = scan_read_word(pc, mem);
+        target = (pc + 2) + disp;
+        pc += 2;
+        *cond_out = VAX_BCOND_UNCOND;
+    } else {           /* BRB and all 1-byte conditional branches */
+        int32_t disp = (int32_t)(int8_t)scan_read_byte(pc, mem);
+        target = (pc + 1) + disp;
+        pc += 1;
+        switch (opc) {
+        case 0x11: *cond_out = VAX_BCOND_UNCOND; break;
+        case 0x12: *cond_out = VAX_BCOND_NEQ;    break;
+        case 0x13: *cond_out = VAX_BCOND_EQL;    break;
+        case 0x14: *cond_out = VAX_BCOND_GTR;    break;
+        case 0x15: *cond_out = VAX_BCOND_LEQ;    break;
+        case 0x18: *cond_out = VAX_BCOND_GEQ;    break;
+        case 0x19: *cond_out = VAX_BCOND_LSS;    break;
+        case 0x1A: *cond_out = VAX_BCOND_GTRU;   break;
+        case 0x1B: *cond_out = VAX_BCOND_LEQU;   break;
+        case 0x1C: *cond_out = VAX_BCOND_VC;     break;
+        case 0x1D: *cond_out = VAX_BCOND_VS;     break;
+        case 0x1E: *cond_out = VAX_BCOND_GEQU;   break;
+        case 0x1F: *cond_out = VAX_BCOND_LSSU;   break;
+        default:   *cond_out = VAX_BCOND_UNCOND; break;
+        }
+    }
+    *pc_inout = pc;
+    return target;
+}
+
+
 /* Scan VAX instructions from start_pc in mem[], filling blk.
    Stops at: branch/call/return opcodes, unknown/unsupported opcodes,
    unsupported operand modes, or VAX_JIT_MAX_INSNS instructions.
@@ -477,11 +557,15 @@ void vax_jit_scan_block(int32_t start_pc, VaxJITBlock *blk, int32_t *mem)
 {
     int32_t pc = start_pc;
     int i;
-    int32_t first_stop_opc = -1;   /* opcode that terminated scan (for telemetry) */
-    blk->n_insns        = 0;
-    blk->fallthrough_pc = start_pc;
+    int32_t first_stop_opc = -1;
+    int32_t scan_end = start_pc;  /* extends rightward as forward branches are found */
+    blk->n_insns          = 0;
+    blk->fallthrough_pc   = start_pc;
+    blk->region_start_pc  = start_pc;
+    blk->has_back_edge    = 0;
 
     while (blk->n_insns < VAX_JIT_MAX_INSNS) {
+        int32_t insn_start_pc = pc;
         int32_t opc = (int32_t)(uint8_t)scan_read_byte(pc, mem);
         pc++;
 
@@ -491,10 +575,41 @@ void vax_jit_scan_block(int32_t start_pc, VaxJITBlock *blk, int32_t *mem)
             pc++;
         }
 
-        /* Stop before any branch/call/return */
-        if (is_branch_opc(opc)) {
+        /* Hard stop: call/return/indirect jump */
+        if (is_hard_stop_opc(opc)) {
             if (first_stop_opc < 0) first_stop_opc = opc;
             break;
+        }
+
+        /* Decodeable branch: decode displacement, classify, add to block */
+        if (is_decodeable_branch_opc(opc)) {
+            uint8_t cond;
+            int32_t target = decode_branch_target(opc, &pc, mem, &cond);
+            /* pc now points past the displacement (fall-through address) */
+
+            /* Backward escape: target escapes before the region → hard stop */
+            if (target < start_pc) {
+                if (first_stop_opc < 0) first_stop_opc = opc;
+                break;
+            }
+
+            /* Back-edge: target is behind the current instruction */
+            if (target < insn_start_pc)
+                blk->has_back_edge = 1;
+
+            /* Extend scan window for forward branches */
+            if (target > scan_end)
+                scan_end = target;
+
+            VaxJITBlkInsn br_insn;
+            br_insn.opc           = opc;
+            br_insn.n_ops         = 0;
+            br_insn.insn_pc       = insn_start_pc;
+            br_insn.branch_target = target;
+            br_insn.branch_cond   = cond;
+            blk->insns[blk->n_insns++] = br_insn;
+            blk->fallthrough_pc = pc;
+            continue;
         }
 
         /* Stop if opcode is not JIT-handled */
@@ -506,8 +621,11 @@ void vax_jit_scan_block(int32_t start_pc, VaxJITBlock *blk, int32_t *mem)
 
         /* Decode operands */
         VaxJITBlkInsn insn;
-        insn.opc   = opc;
-        insn.n_ops = nops;
+        insn.opc           = opc;
+        insn.n_ops         = nops;
+        insn.insn_pc       = insn_start_pc;
+        insn.branch_target = -1;
+        insn.branch_cond   = VAX_BCOND_NONE;
         int ok = 1;
 
         for (i = 0; i < nops; i++) {
@@ -626,7 +744,7 @@ int vax_jit_execute(int32 opc, VAXCPUState *state,
         insn->ops[1] = (nops > 1) ? to_blk_op(&ops[1], w1) : (VaxJITBlkOp){0};
         for (i = 2; i < nops; i++)
             insn->ops[i] = to_blk_op(&ops[i], 4);
-        return vax_jit_llvm_exec_block(&blk, regs, psl, (int32_t*)M);
+        return vax_jit_llvm_exec_block(&blk, regs, psl, (int32_t*)M, &sim_interval);
     }
 
     /* --- Fast path: register/literal/immediate operands only -------- */

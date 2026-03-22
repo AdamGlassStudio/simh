@@ -720,10 +720,10 @@ for ( ;; ) {
         vax_jit_scan_block(PC, &blk, (int32_t *)M);
         if (blk.n_insns > 0) {
             if (vax_jit_llvm_exec_block(&blk, R, &PSL,
-                                        (int32_t *)M)) {
-                /* Block ran: account for all instructions executed.
-                   sim_interval adjustment: subtract (n_insns) instructions.
-                   The normal path subtracts 1 below; we subtract the rest. */
+                                        (int32_t *)M, &sim_interval)) {
+                /* Block ran: account for instructions executed.
+                   Loop blocks also decrement sim_interval on each back-edge
+                   (liveness guarantee); this decrement handles the accounting. */
                 sim_interval = sim_interval - blk.n_insns;
                 extra_bytes  = 0;
                 /* Sync the prefetch buffer to the updated PC */

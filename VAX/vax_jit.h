@@ -107,9 +107,12 @@ void vax_jit_scan_block (int32_t start_pc, VaxJITBlock *blk, int32_t *mem);
 
 /* Compile and execute a multi-instruction block.
    Writes fallthrough_pc into regs[15] before returning.
+   The block manages sim_interval internally for loops (back-edges).
+   For non-loop blocks, *sim_interval is decremented by blk->n_insns.
    Returns 1 on success, 0 on compile failure.                           */
 int  vax_jit_llvm_exec_block (VaxJITBlock *blk, int32_t *regs,
-                               int32_t *psl, int32_t *mem);
+                               int32_t *psl, int32_t *mem,
+                               int32_t *sim_interval);
 
 /* ------------------------------------------------------------------
    JIT telemetry: counters updated by vax_cpu.c, read by SHOW CPU JITSTATS
