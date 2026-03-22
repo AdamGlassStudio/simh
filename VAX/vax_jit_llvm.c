@@ -15,6 +15,7 @@
  */
 
 #include <llvm-c/Core.h>
+#include <llvm-c/Analysis.h>
 #include <llvm-c/ErrorHandling.h>
 #include <llvm-c/LLJIT.h>
 #include <llvm-c/Orc.h>
@@ -1250,6 +1251,15 @@ static void *compile_block(VaxJITBlock *blk, int32_t *sim_interval_ptr)
         }
     }
 
+    /* Always create a dedicated entry BB first.
+       LLVM requires the entry block to have no predecessors. When the JIT
+       re-enters a region at a loop-top PC (e.g. after sim_interval expiry),
+       the first instruction's BB becomes a back-edge target and would violate
+       this constraint if it were also the entry block. The entry BB just
+       falls through unconditionally to the first instruction BB. */
+    LLVMBasicBlockRef entry_bb =
+        LLVMAppendBasicBlockInContext(ctx, fn, "entry");
+
     /* Create LLVM BBs for each BB-start PC */
     BBEntry bb_map[MAX_BB_ENTRIES];
     int n_bb_map = 0;
@@ -1307,10 +1317,15 @@ static void *compile_block(VaxJITBlock *blk, int32_t *sim_interval_ptr)
 
     /* ---- Main emission ---- */
 
-    /* bb_map[0].bb is the function entry point (first BB appended). */
+    /* Populate entry_bb: unconditional branch to the first instruction BB. */
     RegShadow shadow;
     shadow_clear(&shadow);
-    LLVMPositionBuilderAtEnd(b, (n_bb_map > 0) ? bb_map[0].bb : fallthrough_bb);
+    {
+        LLVMBasicBlockRef first_bb = (n_bb_map > 0) ? bb_map[0].bb : fallthrough_bb;
+        LLVMPositionBuilderAtEnd(b, entry_bb);
+        LLVMBuildBr(b, first_bb);
+        LLVMPositionBuilderAtEnd(b, first_bb);
+    }
 
     int builder_terminated = 0;
 
@@ -1398,8 +1413,28 @@ static void *compile_block(VaxJITBlock *blk, int32_t *sim_interval_ptr)
                 if (!ft_bb) ft_bb = fallthrough_bb;
 
                 if (tgt_intra && tgt_bb) {
-                    /* Conditional intra-region: true→target, false→fall-through */
-                    LLVMBuildCondBr(b, cond_val, tgt_bb, ft_bb);
+                    if (tgt < insn->insn_pc) {
+                        /* Conditional backward intra-region (loop back-edge):
+                           on the taken path, decrement sim_interval and check
+                           for expiry before looping — same guard as uncond back-edge. */
+                        LLVMBasicBlockRef iv_check_bb =
+                            LLVMAppendBasicBlockInContext(ctx, fn, "cond_back_iv");
+                        LLVMBuildCondBr(b, cond_val, iv_check_bb, ft_bb);
+
+                        LLVMPositionBuilderAtEnd(b, iv_check_bb);
+                        emit_pc_store(b, i32, v_regs, tgt);
+                        LLVMValueRef old_iv = LLVMBuildLoad2(b, i32, v_siv, "siv");
+                        LLVMValueRef new_iv = LLVMBuildSub(b, old_iv,
+                                                LLVMConstInt(i32, (unsigned)blk->n_insns, 0),
+                                                "sivn");
+                        LLVMBuildStore(b, new_iv, v_siv);
+                        LLVMValueRef expired = LLVMBuildICmp(b, LLVMIntSLE, new_iv,
+                                                LLVMConstInt(i32, 0, 0), "exp");
+                        LLVMBuildCondBr(b, expired, sim_expired_bb, tgt_bb);
+                    } else {
+                        /* Conditional forward intra-region: true→target, false→fall-through */
+                        LLVMBuildCondBr(b, cond_val, tgt_bb, ft_bb);
+                    }
                 } else {
                     /* Conditional exit: true→exit, false→fall-through */
                     LLVMBuildCondBr(b, cond_val,
@@ -1446,6 +1481,13 @@ static void *compile_block(VaxJITBlock *blk, int32_t *sim_interval_ptr)
     }
 
     LLVMDisposeBuilder(b);
+
+    /* Verify IR before handing to optimizer — catches malformed BBs early */
+    if (LLVMVerifyFunction(fn, LLVMPrintMessageAction)) {
+        fprintf(stderr, "vax_jit: IR verification failed for %s\n", sym);
+        LLVMDumpValue(fn);
+        return NULL;
+    }
 
     LLVMErrorRef err = jit_add_module(mod);
     if (err) {
