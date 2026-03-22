@@ -1504,6 +1504,18 @@ static void *compile_block(VaxJITBlock *blk, int32_t *sim_interval_ptr)
 /* Public block execution API                                           */
 /* ------------------------------------------------------------------ */
 
+void *vax_jit_llvm_compile_block(VaxJITBlock *blk, int32_t *sim_interval)
+{
+    return compile_block(blk, sim_interval);
+}
+
+void vax_jit_llvm_run_block(void *fn, int32_t *regs, int32_t *psl,
+                             int32_t *mem, int32_t *sim_interval)
+{
+    typedef void (*BlockFn)(int32_t *, int32_t *, int32_t *, int32_t *);
+    ((BlockFn)fn)(regs, psl, mem, sim_interval);
+}
+
 int vax_jit_llvm_exec_block(VaxJITBlock *blk, int32_t *regs,
                              int32_t *psl, int32_t *mem,
                              int32_t *sim_interval)

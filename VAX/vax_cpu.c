@@ -717,10 +717,31 @@ for ( ;; ) {
            Also sync cc back from PSL after the block so the interpreter resumes
            with correct CC state. */
         PSL = (PSL & ~0xF) | (cc & 0xF);
+
+        /* Cache lookup: if this PC was compiled before, run directly. */
+        void *cached_fn = vax_jit_cache_lookup((uint32_t)PC);
+        if (cached_fn) {
+            uint32_t n = vax_jit_cache_n_insns((uint32_t)PC);
+            vax_jit_llvm_run_block(cached_fn, R, &PSL, (int32_t *)M, &sim_interval);
+            sim_interval -= (int32_t)n;
+            extra_bytes   = 0;
+            ibufl = ibufh = 0;
+            ibcnt = 0;
+            ppc   = PC;
+            cc    = PSL & 0xF;
+            vax_jit_stats.blocks_run++;
+            vax_jit_stats.cache_hits++;
+            vax_jit_stats.insns_jit += n;
+            continue;
+        }
+
         vax_jit_scan_block(PC, &blk, (int32_t *)M);
         if (blk.n_insns > 0) {
-            if (vax_jit_llvm_exec_block(&blk, R, &PSL,
-                                        (int32_t *)M, &sim_interval)) {
+            void *fn = vax_jit_llvm_compile_block(&blk, &sim_interval);
+            if (fn) {
+                vax_jit_cache_insert_n((uint32_t)blk.region_start_pc, fn,
+                                       (uint32_t)blk.n_insns);
+                vax_jit_llvm_run_block(fn, R, &PSL, (int32_t *)M, &sim_interval);
                 /* Block ran: account for instructions executed.
                    Loop blocks also decrement sim_interval on each back-edge
                    (liveness guarantee); this decrement handles the accounting. */

@@ -105,6 +105,14 @@ int  vax_jit_execute (int32 opc, VAXCPUState *state,
    fallthrough_pc is set to the PC after the last accepted instruction.   */
 void vax_jit_scan_block (int32_t start_pc, VaxJITBlock *blk, int32_t *mem);
 
+/* Compile a block and return a host function pointer (or NULL on failure).
+   The caller owns the pointer — it remains valid until vax_jit_cache_flush(). */
+void *vax_jit_llvm_compile_block (VaxJITBlock *blk, int32_t *sim_interval);
+
+/* Execute an already-compiled block function pointer. */
+void vax_jit_llvm_run_block (void *fn, int32_t *regs, int32_t *psl,
+                              int32_t *mem, int32_t *sim_interval);
+
 /* Compile and execute a multi-instruction block.
    Writes fallthrough_pc into regs[15] before returning.
    The block manages sim_interval internally for loops (back-edges).
@@ -119,6 +127,7 @@ int  vax_jit_llvm_exec_block (VaxJITBlock *blk, int32_t *regs,
    ------------------------------------------------------------------ */
 typedef struct {
     uint64_t blocks_run;           /* JIT blocks executed successfully        */
+    uint64_t cache_hits;           /* blocks served from cache (no recompile) */
     uint64_t insns_jit;            /* instructions executed via JIT           */
     uint64_t insns_interp;         /* instructions executed via interpreter   */
     uint64_t scan_empty;           /* scanner found 0 JIT-able instructions   */
@@ -141,6 +150,14 @@ t_stat vax_jit_stats_set  (UNIT *uptr, int32 val, CONST char *cptr, void *desc);
 /* Initialise / shut down the LLVM ORC JIT engine.                       */
 int  vax_jit_init    (void);
 void vax_jit_destroy (void);
+
+/* Flush all block cache entries (call on LDPCTX, MAPEN toggle, etc.)    */
+void vax_jit_cache_flush (void);
+
+/* Look up and insert into the block cache (used by vax_cpu.c).          */
+void    *vax_jit_cache_lookup   (uint32_t pc);
+uint32_t vax_jit_cache_n_insns  (uint32_t pc);
+void     vax_jit_cache_insert_n (uint32_t pc, void *fn, uint32_t n_insns);
 
 /* 1 when JIT is enabled (SET CPU JIT), 0 when disabled (SET CPU NOJIT). */
 extern int vax_jit_enabled;
