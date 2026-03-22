@@ -1424,7 +1424,11 @@ static void *compile_block(VaxJITBlock *blk, int32_t *sim_interval_ptr)
     }
 
     /* ---- Populate fallthrough BB ---- */
+    /* Always write fallthrough_pc here: the fall-off-end path already wrote it
+       via shadow_spill (redundant but harmless), but the conditional-branch-at-
+       end-of-region path does NOT write R15 before branching here. */
     LLVMPositionBuilderAtEnd(b, fallthrough_bb);
+    emit_pc_store(b, i32, v_regs, blk->fallthrough_pc);
     LLVMBuildRetVoid(b);
 
     /* ---- Populate exit BBs ---- */
