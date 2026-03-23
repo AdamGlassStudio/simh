@@ -20,6 +20,19 @@
 #undef PSL
 
 /* ------------------------------------------------------------------ */
+/* VAX CALLS/RET frame constants (mirrors vax_cpu1.c local defines)   */
+/* ------------------------------------------------------------------ */
+
+#define JIT_CALL_MBZ        0x3000          /* reserved bits in entry mask */
+#define JIT_CALL_DV         0x8000          /* DV flag in entry mask */
+#define JIT_CALL_IV         0x4000          /* IV flag in entry mask */
+#define JIT_CALL_MASK       0x0FFF          /* register-save mask (bits 11:0) */
+#define JIT_CALL_V_SPA      30              /* SPA field shift in frame word */
+#define JIT_CALL_V_S        29              /* S flag shift (CALLS vs CALLG) */
+#define JIT_CALL_V_MASK     16              /* reg-mask field shift in frame word */
+#define JIT_CALL_S          (1 << 29)       /* S bit (1 = CALLS, 0 = CALLG) */
+
+/* ------------------------------------------------------------------ */
 /* Integer ALU op kind (must match VaxIntOpL enum in vax_jit_llvm.c)  */
 /* ------------------------------------------------------------------ */
 
@@ -201,10 +214,137 @@ t_stat vax_jit_stats_set(UNIT *uptr, int32 val, CONST char *cptr, void *desc)
     return sim_messagef(SCPE_ARG, "Usage: SET CPU JITSTATS=RESET\n");
 }
 
+/* ------------------------------------------------------------------ */
+/* CALLS/RET C helpers: called from JIT'd code via ORC absolute syms  */
+/* After shadow spill all SIMH state (R[], PSL) is current.           */
+/* regs == R[], psl == &PSL, mem == M[].                              */
+/* ------------------------------------------------------------------ */
+
+void vax_jit_calls_helper_impl(int32_t *regs, int32_t *psl,
+                                int32_t *mem,
+                                int32_t argcount, int32_t callee_addr)
+{
+    int32_t addr = callee_addr;
+    int n;
+
+    /* Read entry mask (16-bit word) from callee entry point */
+    int32_t mask = (int32_t)(uint16_t)(
+        (uint32_t)mem[addr >> 2] >> (((addr & 2)) << 3));
+
+    if (mask & JIT_CALL_MBZ) {
+        /* Reserved-operand fault: leave PC at callee_addr for interpreter */
+        regs[15] = addr;
+        return;
+    }
+
+    /* regs[15] was spilled by the JIT to blk->fallthrough_pc (the return address) */
+    int32_t ret_pc = regs[15];
+    int32_t sp     = regs[14];
+
+    /* Push argcount onto stack (CALLS: gs = 1) */
+    sp -= 4;
+    mem[sp >> 2] = argcount;
+
+    /* Align stack: tsp = sp & ~3 (sp is after argcount push) */
+    int32_t tsp = sp & ~3;
+
+    /* Push saved registers 11 downto 0 using local tsp */
+    for (n = 11; n >= 0; n--) {
+        if ((mask >> n) & 1) {
+            tsp -= 4;
+            mem[tsp >> 2] = regs[n];
+        }
+    }
+
+    /* Write fixed frame:
+         tsp - 4:  return PC
+         tsp - 8:  old FP (regs[13])
+         tsp - 12: old AP (regs[12])
+         tsp - 16: frame word (SPA | S | mask | PSW-low)
+         tsp - 20: condition handler (0)                       */
+    mem[(tsp - 4)  >> 2] = ret_pc;
+    mem[(tsp - 8)  >> 2] = regs[13];  /* old FP */
+    mem[(tsp - 12) >> 2] = regs[12];  /* old AP */
+
+    int32_t wd = ((sp & 3) << JIT_CALL_V_SPA) |
+                 JIT_CALL_S |                          /* S = 1 for CALLS */
+                 ((mask & JIT_CALL_MASK) << JIT_CALL_V_MASK) |
+                 (*psl & 0xFFE0);
+    mem[(tsp - 16) >> 2] = wd;
+    mem[(tsp - 20) >> 2] = 0;         /* condition handler */
+
+    /* Update architectural state */
+    regs[12] = sp;              /* AP = SP (points to argcount word) */
+    int32_t new_fp = tsp - 20;
+    regs[14] = new_fp;          /* SP = new frame base */
+    regs[13] = new_fp;          /* FP = new frame base */
+
+    /* Update PSL: clear DV/FU/IV, then set from entry mask */
+    *psl = (*psl & ~(PSW_DV | PSW_FU | PSW_IV)) |
+           ((mask & JIT_CALL_DV) ? PSW_DV : 0) |
+           ((mask & JIT_CALL_IV) ? PSW_IV : 0);
+
+    /* Set new PC = callee entry (past the 2-byte mask word) */
+    regs[15] = addr + 2;
+}
+
+void vax_jit_ret_helper_impl(int32_t *regs, int32_t *psl, int32_t *mem)
+{
+    int32_t tsp = regs[13];    /* FP */
+    int n;
+
+    /* Load frame word from [FP + 4] */
+    int32_t spamask = mem[(tsp + 4) >> 2];
+
+    if (spamask & PSW_MBZ) {
+        /* Reserved-operand fault: leave regs as-is; interpreter handles */
+        return;
+    }
+
+    /* Restore AP, FP, return PC from fixed frame */
+    regs[12]       = mem[(tsp + 8)  >> 2];  /* old AP */
+    regs[13]       = mem[(tsp + 12) >> 2];  /* old FP */
+    int32_t ret_pc = mem[(tsp + 16) >> 2];  /* return PC */
+
+    /* Restore saved registers starting at FP + 20 */
+    tsp += 20;
+    for (n = 0; n <= 11; n++) {
+        if ((spamask >> (n + JIT_CALL_V_MASK)) & 1) {
+            regs[n] = mem[tsp >> 2];
+            tsp += 4;
+        }
+    }
+
+    /* Dealign stack: SP = tsp + SPA */
+    int32_t sp = tsp + ((spamask >> JIT_CALL_V_SPA) & 3);
+
+    /* If CALLS (S bit set): pop argcount + arg list */
+    if (spamask & JIT_CALL_S) {
+        int32_t nargs = mem[sp >> 2] & 0xFF;  /* BMASK = 0xFF */
+        sp = sp + 4 + (nargs << 2);
+    }
+
+    regs[14] = sp;   /* SP */
+
+    /* Update PSL: restore saved DV/FU/IV/T bits and CC bits from frame.
+       op_ret restores DV/FU/IV/T via PSL assignment and returns CC via
+       the dispatch-loop return value.  In the JIT we do both here. */
+    *psl = (*psl & ~(CC_MASK | PSW_DV | PSW_FU | PSW_IV | PSW_T)) |
+           (spamask & (CC_MASK | PSW_DV | PSW_FU | PSW_IV | PSW_T));
+
+    /* Set new PC = return address from frame */
+    regs[15] = ret_pc;
+}
+
 int vax_jit_init(void)
 {
     vax_jit_llvm_set_ir_dump(vax_jit_ir_dump);
-    return vax_jit_llvm_init();
+    if (vax_jit_llvm_init() != 0)
+        return -1;
+    vax_jit_llvm_register_call_helpers(
+        (void *)vax_jit_calls_helper_impl,
+        (void *)vax_jit_ret_helper_impl);
+    return 0;
 }
 void vax_jit_destroy(void) { vax_jit_llvm_destroy(); }
 
@@ -617,6 +757,68 @@ void vax_jit_scan_block(int32_t start_pc, VaxJITBlock *blk, int32_t *mem)
         if (opc == 0xFD) {
             opc = 0x100 | (int32_t)(uint8_t)scan_read_byte(pc, mem);
             pc++;
+        }
+
+        /* Complex exits: CALLS (0xFB) and RET (0x04).
+           These terminate the block but are handled by the JIT (they emit
+           C-helper calls for frame setup/teardown rather than a simple exit). */
+        if (opc == 0xFB /* CALLS */ || opc == 0x04 /* RET */) {
+            VaxJITBlkInsn insn;
+            insn.opc           = opc;
+            insn.insn_pc       = insn_start_pc;
+            insn.branch_target = -1;
+            insn.branch_cond   = VAX_BCOND_NONE;
+            insn.n_ops         = 0;
+
+            if (opc == 0xFB) {
+                /* CALLS has 2 operands: argcount and callee address.
+                   We only JIT direct calls (callee = PC-relative displacement).
+                   Indirect calls (callee in register or memory) fall to interpreter. */
+                int ok = 1;
+                VaxJITOperand ops[2];
+                for (i = 0; i < 2 && ok; i++) {
+                    int32_t spec   = (int32_t)(uint8_t)scan_read_byte(pc, mem);
+                    pc++;
+                    int32_t ext    = vax_jit_spec_ext_lnt(spec, 4);
+                    if (ext > 4) { ok = 0; break; }
+                    int32_t follow = 0;
+                    if (ext == 1) follow = (int32_t)(int8_t)scan_read_byte(pc, mem);
+                    else if (ext == 2) follow = scan_read_word(pc, mem);
+                    else if (ext == 4) follow = scan_read_long(pc, mem);
+                    pc += ext;
+                    vax_jit_decode_operand(spec, follow, pc, &ops[i]);
+                    if (ops[i].kind == JITOPK_UNSUPPORTED) { ok = 0; break; }
+                }
+
+                if (!ok) {
+                    if (first_stop_opc < 0) first_stop_opc = opc;
+                    break;
+                }
+
+                /* Argcount: literal/immediate (compile-time value) or register (runtime). */
+                if (ops[0].kind != JITOPK_LITERAL   &&
+                    ops[0].kind != JITOPK_IMMEDIATE  &&
+                    ops[0].kind != JITOPK_REGISTER) {
+                    if (first_stop_opc < 0) first_stop_opc = opc;
+                    break;
+                }
+
+                /* Callee address: must be PC-relative (reg==15) so the address
+                   is a compile-time constant already stored in ops[1].imm. */
+                if (!(ops[1].kind == JITOPK_DISP && ops[1].reg == nPC)) {
+                    if (first_stop_opc < 0) first_stop_opc = opc;
+                    break;
+                }
+
+                insn.n_ops  = 2;
+                insn.ops[0] = to_blk_op(&ops[0], 4);
+                insn.ops[1] = to_blk_op(&ops[1], 4);
+            }
+            /* RET has no operands; insn.n_ops stays 0 */
+
+            blk->insns[blk->n_insns++] = insn;
+            blk->fallthrough_pc = pc;   /* instruction after CALLS/RET = return address */
+            break;
         }
 
         /* Hard stop: call/return/indirect jump */
