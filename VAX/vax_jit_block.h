@@ -61,7 +61,7 @@ typedef struct {
     uint8_t     branch_cond;   /* VaxBCond value */
 } VaxJITBlkInsn;
 
-#define VAX_JIT_MAX_INSNS 64
+#define VAX_JIT_MAX_INSNS 32
 
 typedef struct {
     int           n_insns;

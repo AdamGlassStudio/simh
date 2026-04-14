@@ -1957,59 +1957,58 @@ static void *compile_block(VaxJITBlock *blk, int32_t *sim_interval_ptr)
                 }
                 builder_terminated = 1;
             }
-        } else if (insn->opc == 0x04 /* RET */) {
-            /* RET: emit helper call then exit block. */
+        } else if (insn->opc == 0xFB /* CALLS */ || insn->opc == 0x04 /* RET */) {
+            /* CALLS/RET: emit C-helper call then exit.
+               The helpers read/write regs[] and psl directly after shadow spill. */
+
+            if (insn->opc == 0xFB) {
+                /* Set R15 = blk->fallthrough_pc (= return address stored in frame) */
+                shadow_set(&shadow, 15,
+                           LLVMConstInt(i32, (uint32_t)blk->fallthrough_pc, 0));
+            }
             shadow_spill(b, i32, &shadow, v_regs);
 
-            LLVMTypeRef  parms3[3] = { ptr, ptr, ptr };
-            LLVMTypeRef  fn3_ty    = LLVMFunctionType(
-                                         LLVMVoidTypeInContext(ctx), parms3, 3, 0);
-            LLVMValueRef ext_fn    = LLVMAddFunction(mod,
-                                         "vax_jit_ret_helper", fn3_ty);
+            /* Declare external helper functions in this module */
+            if (insn->opc == 0xFB) {
+                /* vax_jit_calls_helper(ptr regs, ptr psl, ptr mem, i32 argc, i32 callee) */
+                LLVMTypeRef  parms5[5] = { ptr, ptr, ptr, i32, i32 };
+                LLVMTypeRef  fn5_ty    = LLVMFunctionType(
+                                             LLVMVoidTypeInContext(ctx), parms5, 5, 0);
+                LLVMValueRef ext_fn    = LLVMAddFunction(mod,
+                                             "vax_jit_calls_helper", fn5_ty);
 
-            LLVMValueRef args3[3] = { v_regs, v_psl, v_mem };
-            LLVMBuildCall2(b, fn3_ty, ext_fn, args3, 3, "");
+                /* Compute argcount: literal/immediate → constant; register → load */
+                VaxJITBlkOp *op0 = &insn->ops[0];
+                LLVMValueRef argc_val;
+                if (op0->kind == JITBLK_LITERAL || op0->kind == JITBLK_IMMEDIATE) {
+                    argc_val = LLVMConstInt(i32, (uint32_t)op0->imm, 0);
+                } else {
+                    /* JITBLK_REGISTER: load from regs (shadow already spilled) */
+                    LLVMValueRef idx = LLVMConstInt(i32, (unsigned)op0->reg, 0);
+                    LLVMValueRef rp  = LLVMBuildGEP2(b, i32, v_regs, &idx, 1, "");
+                    argc_val = LLVMBuildLoad2(b, i32, rp, "argc");
+                }
+
+                /* ops[1] for CALLS is JITBLK_DISP+reg=15: imm = absolute callee addr */
+                LLVMValueRef callee_val =
+                    LLVMConstInt(i32, (uint32_t)insn->ops[1].imm, 0);
+
+                LLVMValueRef args5[5] = { v_regs, v_psl, v_mem, argc_val, callee_val };
+                LLVMBuildCall2(b, fn5_ty, ext_fn, args5, 5, "");
+            } else {
+                /* vax_jit_ret_helper(ptr regs, ptr psl, ptr mem) */
+                LLVMTypeRef  parms3[3] = { ptr, ptr, ptr };
+                LLVMTypeRef  fn3_ty    = LLVMFunctionType(
+                                             LLVMVoidTypeInContext(ctx), parms3, 3, 0);
+                LLVMValueRef ext_fn    = LLVMAddFunction(mod,
+                                             "vax_jit_ret_helper", fn3_ty);
+
+                LLVMValueRef args3[3] = { v_regs, v_psl, v_mem };
+                LLVMBuildCall2(b, fn3_ty, ext_fn, args3, 3, "");
+            }
 
             LLVMBuildRetVoid(b);
             builder_terminated = 1;
-        } else if (insn->opc == 0xFB /* CALLS */) {
-            /* CALLS mid-block: spill, call helper, clear shadows, continue.
-               branch_target holds the return address (PC after CALLS). */
-            int32_t ret_addr = insn->branch_target;
-
-            /* Set R15 = return address before spilling */
-            shadow_set(&shadow, 15,
-                       LLVMConstInt(i32, (uint32_t)ret_addr, 0));
-            shadow_spill(b, i32, &shadow, v_regs);
-
-            /* vax_jit_calls_helper(ptr regs, ptr psl, ptr mem, i32 argc, i32 callee) */
-            LLVMTypeRef  parms5[5] = { ptr, ptr, ptr, i32, i32 };
-            LLVMTypeRef  fn5_ty    = LLVMFunctionType(
-                                         LLVMVoidTypeInContext(ctx), parms5, 5, 0);
-            LLVMValueRef ext_fn    = LLVMAddFunction(mod,
-                                         "vax_jit_calls_helper", fn5_ty);
-
-            VaxJITBlkOp *op0 = &insn->ops[0];
-            LLVMValueRef argc_val;
-            if (op0->kind == JITBLK_LITERAL || op0->kind == JITBLK_IMMEDIATE) {
-                argc_val = LLVMConstInt(i32, (uint32_t)op0->imm, 0);
-            } else {
-                /* JITBLK_REGISTER: load from regs (shadow already spilled) */
-                LLVMValueRef idx = LLVMConstInt(i32, (unsigned)op0->reg, 0);
-                LLVMValueRef rp  = LLVMBuildGEP2(b, i32, v_regs, &idx, 1, "");
-                argc_val = LLVMBuildLoad2(b, i32, rp, "argc");
-            }
-
-            LLVMValueRef callee_val =
-                LLVMConstInt(i32, (uint32_t)insn->ops[1].imm, 0);
-
-            LLVMValueRef args5[5] = { v_regs, v_psl, v_mem, argc_val, callee_val };
-            LLVMBuildCall2(b, fn5_ty, ext_fn, args5, 5, "");
-
-            /* Callee may have modified any register — invalidate all shadows.
-               Reload will happen lazily as subsequent instructions need them. */
-            shadow_clear(&shadow);
-            builder_terminated = 0;
         } else {
             /* Normal non-branch instruction */
             emit_insn(b, i32, insn, &shadow, v_regs, v_psl, v_mem);
