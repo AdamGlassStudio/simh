@@ -815,7 +815,6 @@ static int is_branch_opc(int32_t opc)
     case 0xE8: /* BLBS   */
     case 0xE9: /* BLBC   */
     case 0xFA: /* CALLG  */
-    case 0xFB: /* CALLS  */
         return 1;
     default:
         return 0;
@@ -827,7 +826,6 @@ static int is_branch_opc(int32_t opc)
 static int is_hard_stop_opc(int32_t opc)
 {
     switch (opc) {
-    case 0x04: /* RET    */
     case 0x05: /* RSB    */
     case 0x10: /* BSBB   */
     case 0x16: /* JSB    */
@@ -842,7 +840,6 @@ static int is_hard_stop_opc(int32_t opc)
     case 0xE8: /* BLBS   */
     case 0xE9: /* BLBC   */
     case 0xFA: /* CALLG  */
-    case 0xFB: /* CALLS  */
         return 1;
     default:
         return 0;
@@ -926,68 +923,71 @@ void vax_jit_scan_block(int32_t start_pc, VaxJITBlock *blk, int32_t *mem)
             pc++;
         }
 
-        /* Complex exits: CALLS (0xFB) and RET (0x04).
-           These terminate the block but are handled by the JIT (they emit
-           C-helper calls for frame setup/teardown rather than a simple exit). */
-        if (opc == 0xFB /* CALLS */ || opc == 0x04 /* RET */) {
+        /* RET (0x04): terminates the block — this is the scan-to-RET boundary. */
+        if (opc == 0x04 /* RET */) {
             VaxJITBlkInsn insn;
             insn.opc           = opc;
             insn.insn_pc       = insn_start_pc;
             insn.branch_target = -1;
             insn.branch_cond   = VAX_BCOND_NONE;
             insn.n_ops         = 0;
-
-            if (opc == 0xFB) {
-                /* CALLS has 2 operands: argcount and callee address.
-                   We only JIT direct calls (callee = PC-relative displacement).
-                   Indirect calls (callee in register or memory) fall to interpreter. */
-                int ok = 1;
-                VaxJITOperand ops[2];
-                for (i = 0; i < 2 && ok; i++) {
-                    int32_t spec   = (int32_t)(uint8_t)scan_read_byte(pc, mem);
-                    pc++;
-                    int32_t ext    = vax_jit_spec_ext_lnt(spec, 4);
-                    if (ext > 4) { ok = 0; break; }
-                    int32_t follow = 0;
-                    if (ext == 1) follow = (int32_t)(int8_t)scan_read_byte(pc, mem);
-                    else if (ext == 2) follow = scan_read_word(pc, mem);
-                    else if (ext == 4) follow = scan_read_long(pc, mem);
-                    pc += ext;
-                    vax_jit_decode_operand(spec, follow, pc, &ops[i]);
-                    if (ops[i].kind == JITOPK_UNSUPPORTED) { ok = 0; break; }
-                }
-
-                if (!ok) {
-                    if (first_stop_opc < 0) first_stop_opc = opc;
-                    break;
-                }
-
-                /* Argcount: literal/immediate (compile-time value) or register (runtime). */
-                if (ops[0].kind != JITOPK_LITERAL   &&
-                    ops[0].kind != JITOPK_IMMEDIATE  &&
-                    ops[0].kind != JITOPK_REGISTER) {
-                    if (first_stop_opc < 0) first_stop_opc = opc;
-                    break;
-                }
-
-                /* Callee address: must be a compile-time constant.
-                   Accept PC-relative displacement (W^/L^ in assembly) or
-                   absolute address (0x9F mode, as emitted by compilers/as). */
-                if (!((ops[1].kind == JITOPK_DISP && ops[1].reg == nPC) ||
-                      ops[1].kind == JITOPK_ABSOLUTE)) {
-                    if (first_stop_opc < 0) first_stop_opc = opc;
-                    break;
-                }
-
-                insn.n_ops  = 2;
-                insn.ops[0] = to_blk_op(&ops[0], 4);
-                insn.ops[1] = to_blk_op(&ops[1], 4);
-            }
-            /* RET has no operands; insn.n_ops stays 0 */
-
             blk->insns[blk->n_insns++] = insn;
-            blk->fallthrough_pc = pc;   /* instruction after CALLS/RET = return address */
+            blk->fallthrough_pc = pc;
             break;
+        }
+
+        /* CALLS (0xFB): mid-block instruction — scan past it to reach RET.
+           Decode operands but do NOT break; continue scanning. */
+        if (opc == 0xFB /* CALLS */) {
+            VaxJITBlkInsn insn;
+            insn.opc           = opc;
+            insn.insn_pc       = insn_start_pc;
+            insn.branch_cond   = VAX_BCOND_NONE;
+
+            int ok = 1;
+            VaxJITOperand ops[2];
+            for (i = 0; i < 2 && ok; i++) {
+                int32_t spec   = (int32_t)(uint8_t)scan_read_byte(pc, mem);
+                pc++;
+                int32_t ext    = vax_jit_spec_ext_lnt(spec, 4);
+                if (ext > 4) { ok = 0; break; }
+                int32_t follow = 0;
+                if (ext == 1) follow = (int32_t)(int8_t)scan_read_byte(pc, mem);
+                else if (ext == 2) follow = scan_read_word(pc, mem);
+                else if (ext == 4) follow = scan_read_long(pc, mem);
+                pc += ext;
+                vax_jit_decode_operand(spec, follow, pc, &ops[i]);
+                if (ops[i].kind == JITOPK_UNSUPPORTED) { ok = 0; break; }
+            }
+
+            if (!ok) {
+                if (first_stop_opc < 0) first_stop_opc = opc;
+                break;
+            }
+
+            if (ops[0].kind != JITOPK_LITERAL   &&
+                ops[0].kind != JITOPK_IMMEDIATE  &&
+                ops[0].kind != JITOPK_REGISTER) {
+                if (first_stop_opc < 0) first_stop_opc = opc;
+                break;
+            }
+
+            if (!((ops[1].kind == JITOPK_DISP && ops[1].reg == nPC) ||
+                  ops[1].kind == JITOPK_ABSOLUTE)) {
+                if (first_stop_opc < 0) first_stop_opc = opc;
+                break;
+            }
+
+            insn.n_ops  = 2;
+            insn.ops[0] = to_blk_op(&ops[0], 4);
+            insn.ops[1] = to_blk_op(&ops[1], 4);
+            /* Store the return address (PC after CALLS) so the compiler
+               knows what to set R15 to before calling the helper. */
+            insn.branch_target = pc;
+            blk->insns[blk->n_insns++] = insn;
+            blk->fallthrough_pc = pc;
+            /* Continue scanning past CALLS — don't break */
+            continue;
         }
 
         /* Hard stop: call/return/indirect jump */
