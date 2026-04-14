@@ -467,6 +467,20 @@ static int compile_tstl(void)
 #define VAX_OPC_PUSHR  0xBB
 #define VAX_OPC_MOVPSL 0xDC
 
+#define VAX_OPC_MOVZBW 0x9B
+#define VAX_OPC_MOVF   0x50
+#define VAX_OPC_CLRQ   0x7C
+#define VAX_OPC_ADWC   0xD8
+#define VAX_OPC_SBWC   0xD9
+#define VAX_OPC_ADAWI  0x58
+#define VAX_OPC_POPR   0xBA
+#define VAX_OPC_ASHQ   0x79
+#define VAX_OPC_EMUL   0x7A
+#define VAX_OPC_EDIV   0x7B
+#define VAX_OPC_EXTZV  0xEF
+#define VAX_OPC_INSV   0xF0
+#define VAX_OPC_MOVC3  0x28
+
 /* ------------------------------------------------------------------ */
 /* Register shadow: tracks loaded/modified register values             */
 /* NULL = not yet loaded; non-NULL = loaded (and possibly modified).   */
@@ -647,6 +661,9 @@ static void emit_write_operand(LLVMBuilderRef b, LLVMTypeRef i32,
         emit_mem_store(b, i32, mem, ea, val, op->width);
     }
 }
+
+/* Forward declaration (defined later in compile_block section) */
+static void shadow_clear(RegShadow *s);
 
 /* Emit IR for one VAX instruction into the current basic block. */
 static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
@@ -1070,6 +1087,503 @@ static void emit_insn(LLVMBuilderRef b, LLVMTypeRef i32,
         result = LLVMBuildLoad2(b, i32, v_psl, "psl");
         emit_write_operand(b, i32, &insn->ops[0], ea0, result, s, regs, mem);
         /* MOVPSL does not alter CC */
+        return;
+    }
+
+    /* MOVZBW src.rb, dst.ww  :  dst[15:0] = zero_extend(src[7:0]), CC on word */
+    case VAX_OPC_MOVZBW:
+        ea0 = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        ea1 = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
+        src = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
+        cc  = build_cc_logical(b, i32, src, 0xFFFFu, 0x8000u);
+        emit_write_operand(b, i32, &insn->ops[1], ea1, src, s, regs, mem);
+        build_psl_update_logical(b, i32, v_psl, cc);
+        return;
+
+    /* MOVF src.rf, dst.wf  :  dst = src (F-float is a longword), CC on float sign */
+    case VAX_OPC_MOVF:
+        ea0 = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        ea1 = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
+        src = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
+        /* CC_IIZP_FP = CC_IIZP_W: N from bit 15 (float sign), Z from full longword */
+        cc  = build_cc_logical(b, i32, src, 0xFFFFu, 0x8000u);
+        emit_write_operand(b, i32, &insn->ops[1], ea1, src, s, regs, mem);
+        build_psl_update_logical(b, i32, v_psl, cc);
+        return;
+
+    /* CLRQ dst.wq  :  dst = 0 (quadword), CC: N=0, Z=1, V=0, C preserved */
+    case VAX_OPC_CLRQ: {
+        LLVMValueRef zero = LLVMConstInt(i32, 0, 0);
+        if (insn->ops[0].kind == JITBLK_REGISTER) {
+            shadow_set(s, insn->ops[0].reg,             zero);
+            shadow_set(s, (insn->ops[0].reg + 1) & 15, zero);
+        } else {
+            LLVMValueRef ea_lo = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+            LLVMValueRef ea_hi = LLVMBuildAdd(b, ea_lo, LLVMConstInt(i32, 4, 0), "eahi");
+            emit_mem_store(b, i32, mem, ea_lo, zero, 4);
+            emit_mem_store(b, i32, mem, ea_hi, zero, 4);
+        }
+        /* CC_ZZ1P: Z=1, C preserved */
+        LLVMValueRef old_psl = LLVMBuildLoad2(b, i32, v_psl, "po");
+        LLVMValueRef c_bit   = LLVMBuildAnd(b, old_psl, LLVMConstInt(i32, 1, 0), "cb");
+        cc = LLVMBuildOr(b, LLVMConstInt(i32, 0x04, 0), c_bit, "cc");
+        build_psl_update(b, i32, v_psl, cc);
+        return;
+    }
+
+    /* ADWC src.rl, dst.ml  :  dst = dst + src + C */
+    case VAX_OPC_ADWC: {
+        ea0     = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        ea1     = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
+        src     = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
+        dst_old = emit_read_operand(b, i32, &insn->ops[1], ea1, s, regs, mem);
+        /* Extract carry-in from current PSL bit 0 */
+        LLVMValueRef psl_val = LLVMBuildLoad2(b, i32, v_psl, "psl");
+        LLVMValueRef carry_in = LLVMBuildAnd(b, psl_val, LLVMConstInt(i32, 1, 0), "cin");
+        /* tmp = dst + src; result = tmp + carry_in */
+        LLVMValueRef tmp = LLVMBuildAdd(b, dst_old, src, "tmp");
+        result = LLVMBuildAdd(b, tmp, carry_in, "r");
+        /* CC_ADD_L(r, op0, op1): standard add CC from src + dst_old */
+        cc = build_cc_add(b, i32, src, dst_old, result, 0xFFFFFFFFu, 0x80000000u);
+        /* Special case: if (r == op1) && op0 → set C.
+           This handles the carry-through case where the main add carried
+           but carry_in addition brought result back equal to dst_old. */
+        LLVMValueRef zero = LLVMConstInt(i32, 0, 0);
+        LLVMValueRef r_eq_dst = LLVMBuildICmp(b, LLVMIntEQ, result, dst_old, "req");
+        LLVMValueRef src_nz   = LLVMBuildICmp(b, LLVMIntNE, src, zero, "snz");
+        LLVMValueRef special  = LLVMBuildAnd(b, r_eq_dst, src_nz, "spc");
+        LLVMValueRef extra_c  = LLVMBuildSelect(b, special, LLVMConstInt(i32, 1, 0), zero, "ec");
+        cc = LLVMBuildOr(b, cc, extra_c, "cc2");
+        emit_write_operand(b, i32, &insn->ops[1], ea1, result, s, regs, mem);
+        build_psl_update(b, i32, v_psl, cc);
+        return;
+    }
+
+    /* SBWC src.rl, dst.ml  :  dst = dst - src - C */
+    case VAX_OPC_SBWC: {
+        ea0     = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        ea1     = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
+        src     = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
+        dst_old = emit_read_operand(b, i32, &insn->ops[1], ea1, s, regs, mem);
+        LLVMValueRef psl_val = LLVMBuildLoad2(b, i32, v_psl, "psl");
+        LLVMValueRef carry_in = LLVMBuildAnd(b, psl_val, LLVMConstInt(i32, 1, 0), "cin");
+        LLVMValueRef tmp = LLVMBuildSub(b, dst_old, src, "tmp");
+        result = LLVMBuildSub(b, tmp, carry_in, "r");
+        cc = build_cc_sub(b, i32, src, dst_old, result, 0xFFFFFFFFu, 0x80000000u);
+        /* Special case: if (op0 == op1) && r → set C */
+        LLVMValueRef zero = LLVMConstInt(i32, 0, 0);
+        LLVMValueRef eq   = LLVMBuildICmp(b, LLVMIntEQ, src, dst_old, "eq");
+        LLVMValueRef r_nz = LLVMBuildICmp(b, LLVMIntNE, result, zero, "rnz");
+        LLVMValueRef special = LLVMBuildAnd(b, eq, r_nz, "spc");
+        LLVMValueRef extra_c = LLVMBuildSelect(b, special, LLVMConstInt(i32, 1, 0), zero, "ec");
+        cc = LLVMBuildOr(b, cc, extra_c, "cc2");
+        emit_write_operand(b, i32, &insn->ops[1], ea1, result, s, regs, mem);
+        build_psl_update(b, i32, v_psl, cc);
+        return;
+    }
+
+    /* ADAWI src.rw, dst.mw  :  dst = dst + src (word), set CC */
+    case VAX_OPC_ADAWI: {
+        ea0     = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        ea1     = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
+        src     = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
+        dst_old = emit_read_operand(b, i32, &insn->ops[1], ea1, s, regs, mem);
+        result  = LLVMBuildAnd(b, LLVMBuildAdd(b, dst_old, src, "sum"),
+                               LLVMConstInt(i32, 0xFFFF, 0), "r");
+        cc = build_cc_add(b, i32, src, dst_old, result, 0xFFFFu, 0x8000u);
+        emit_write_operand(b, i32, &insn->ops[1], ea1, result, s, regs, mem);
+        build_psl_update(b, i32, v_psl, cc);
+        return;
+    }
+
+    /* POPR mask.rw — pop selected registers R0..R14 from stack. */
+    case VAX_OPC_POPR: {
+        LLVMValueRef mask_val = emit_read_operand(b, i32, &insn->ops[0], NULL,
+                                                   s, regs, mem);
+        uint32_t mask = (uint32_t)LLVMConstIntGetZExtValue(mask_val) & 0x7FFF;
+        LLVMValueRef sp = shadow_get(b, i32, s, 14, regs);
+        int ri;
+        for (ri = 0; ri <= 13; ri++) {
+            if (mask & (1u << ri)) {
+                LLVMValueRef rv = emit_mem_load(b, i32, mem, sp, 4);
+                shadow_set(s, ri, rv);
+                sp = LLVMBuildAdd(b, sp, LLVMConstInt(i32, 4, 0), "sp");
+            }
+        }
+        /* SP (R14): if bit 14 set, load SP from stack but don't increment */
+        if (mask & (1u << 14)) {
+            LLVMValueRef rv = emit_mem_load(b, i32, mem, sp, 4);
+            shadow_set(s, 14, rv);
+        } else {
+            shadow_set(s, 14, sp);
+        }
+        /* POPR does not set CC */
+        return;
+    }
+
+    /* ASHQ cnt.rb, src.rq, dst.wq  :  arithmetic shift quadword */
+    case VAX_OPC_ASHQ: {
+        LLVMContextRef lctx = LLVMGetTypeContext(i32);
+        LLVMTypeRef i8   = LLVMInt8TypeInContext(lctx);
+        LLVMTypeRef i64  = LLVMInt64TypeInContext(lctx);
+        LLVMTypeRef i1   = LLVMInt1TypeInContext(lctx);
+        LLVMValueRef zero32 = LLVMConstInt(i32, 0, 0);
+        LLVMValueRef zero64 = LLVMConstInt(i64, 0, 0);
+
+        ea0 = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        LLVMValueRef v_cnt = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
+
+        /* Read source quadword */
+        LLVMValueRef v_lo, v_hi;
+        if (insn->ops[1].kind == JITBLK_REGISTER) {
+            v_lo = shadow_get(b, i32, s, insn->ops[1].reg,             regs);
+            v_hi = shadow_get(b, i32, s, (insn->ops[1].reg + 1) & 15, regs);
+        } else {
+            LLVMValueRef ea_lo = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
+            LLVMValueRef ea_hi = LLVMBuildAdd(b, ea_lo, LLVMConstInt(i32, 4, 0), "eahi");
+            v_lo = emit_mem_load(b, i32, mem, ea_lo, 4);
+            v_hi = emit_mem_load(b, i32, mem, ea_hi, 4);
+        }
+
+        /* Build 64-bit source */
+        LLVMValueRef lo64 = LLVMBuildZExt(b, v_lo, i64, "lo64");
+        LLVMValueRef hi64 = LLVMBuildShl(b, LLVMBuildZExt(b, v_hi, i64, "hi64e"),
+                                          LLVMConstInt(i64, 32, 0), "hi64");
+        LLVMValueRef src64 = LLVMBuildOr(b, lo64, hi64, "src64");
+
+        /* Sign-extend cnt from byte */
+        LLVMValueRef cnt8  = LLVMBuildTrunc(b, v_cnt, i8, "c8");
+        LLVMValueRef cnt32 = LLVMBuildSExt(b, cnt8, i32, "c32");
+        LLVMValueRef is_left  = LLVMBuildICmp(b, LLVMIntSGT, cnt32, zero32, "il");
+        LLVMValueRef is_right = LLVMBuildICmp(b, LLVMIntSLT, cnt32, zero32, "ir");
+        LLVMValueRef neg_cnt  = LLVMBuildNeg(b, cnt32, "nc");
+        LLVMValueRef abs_cnt  = LLVMBuildSelect(b, is_left, cnt32, neg_cnt, "ac");
+        LLVMValueRef abs_cnt64 = LLVMBuildZExt(b, abs_cnt, i64, "ac64");
+        LLVMValueRef c63   = LLVMConstInt(i64, 63, 0);
+        LLVMValueRef c64i  = LLVMConstInt(i32, 64, 0);
+        LLVMValueRef big   = LLVMBuildICmp(b, LLVMIntSGE, abs_cnt, LLVMConstInt(i32, 64, 0), "big");
+        LLVMValueRef clamped64 = LLVMBuildSelect(b, big, c63, abs_cnt64, "cl64");
+
+        /* Left shift */
+        LLVMValueRef shl_res  = LLVMBuildShl(b, src64, clamped64, "ls");
+        LLVMValueRef left_res = LLVMBuildSelect(b, big, zero64, shl_res, "lr");
+        /* V for left shift: round-trip check */
+        LLVMValueRef recover  = LLVMBuildAShr(b, shl_res, clamped64, "rv");
+        LLVMValueRef v_left   = LLVMBuildICmp(b, LLVMIntNE, recover, src64, "vl");
+        LLVMValueRef v_big    = LLVMBuildICmp(b, LLVMIntNE, src64, zero64, "vb");
+        LLVMValueRef v_left_f = LLVMBuildSelect(b, big, v_big, v_left, "vlf");
+
+        /* Right shift */
+        LLVMValueRef shr_res   = LLVMBuildAShr(b, src64, clamped64, "rs");
+        LLVMValueRef shr_big   = LLVMBuildAShr(b, src64, c63, "sb");
+        LLVMValueRef right_res = LLVMBuildSelect(b, big, shr_big, shr_res, "rr");
+
+        /* Select direction */
+        LLVMValueRef res64 = LLVMBuildSelect(b, is_left, left_res,
+                                 LLVMBuildSelect(b, is_right, right_res, src64, "zr"), "res");
+        LLVMValueRef v_flag = LLVMBuildSelect(b, is_left, v_left_f,
+                                 LLVMConstInt(i1, 0, 0), "vf");
+
+        /* Split result to lo/hi */
+        LLVMValueRef r_lo = LLVMBuildTrunc(b, res64, i32, "rlo");
+        LLVMValueRef r_hi = LLVMBuildTrunc(b, LLVMBuildLShr(b, res64,
+                                LLVMConstInt(i64, 32, 0), "rsh"), i32, "rhi");
+
+        /* Write destination quadword */
+        if (insn->ops[2].kind == JITBLK_REGISTER) {
+            shadow_set(s, insn->ops[2].reg,             r_lo);
+            shadow_set(s, (insn->ops[2].reg + 1) & 15, r_hi);
+        } else {
+            LLVMValueRef ea_lo = emit_operand_ea(b, i32, &insn->ops[2], s, regs, mem);
+            LLVMValueRef ea_hi = LLVMBuildAdd(b, ea_lo, LLVMConstInt(i32, 4, 0), "eadhi");
+            emit_mem_store(b, i32, mem, ea_lo, r_lo, 4);
+            emit_mem_store(b, i32, mem, ea_hi, r_hi, 4);
+        }
+
+        /* CC: N from hi bit31, Z from (lo|hi)==0, V from overflow, C=0 */
+        LLVMValueRef n_f = LLVMBuildICmp(b, LLVMIntSLT, r_hi, zero32, "n");
+        LLVMValueRef lz  = LLVMBuildICmp(b, LLVMIntEQ,  r_lo, zero32, "lz");
+        LLVMValueRef hz  = LLVMBuildICmp(b, LLVMIntEQ,  r_hi, zero32, "hz");
+        LLVMValueRef z_f = LLVMBuildAnd(b, lz, hz, "z");
+        LLVMValueRef pn  = LLVMBuildSelect(b, n_f,    LLVMConstInt(i32, 0x08, 0), zero32, "pn");
+        LLVMValueRef pz  = LLVMBuildSelect(b, z_f,    LLVMConstInt(i32, 0x04, 0), zero32, "pz");
+        LLVMValueRef pv  = LLVMBuildSelect(b, v_flag,  LLVMConstInt(i32, 0x02, 0), zero32, "pv");
+        cc = LLVMBuildOr(b, LLVMBuildOr(b, pn, pz, "cc1"), pv, "cc");
+        build_psl_update(b, i32, v_psl, cc);
+        (void)c64i;
+        return;
+    }
+
+    /* EMUL mulr.rl, muld.rl, add.rl, prod.wq  :  prod = mulr * muld + sext(add) */
+    case VAX_OPC_EMUL: {
+        LLVMContextRef lctx = LLVMGetTypeContext(i32);
+        LLVMTypeRef i64  = LLVMInt64TypeInContext(lctx);
+        LLVMValueRef zero32 = LLVMConstInt(i32, 0, 0);
+
+        ea0 = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        ea1 = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
+        LLVMValueRef ea2 = emit_operand_ea(b, i32, &insn->ops[2], s, regs, mem);
+        LLVMValueRef ea3 = emit_operand_ea(b, i32, &insn->ops[3], s, regs, mem);
+
+        LLVMValueRef mulr = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
+        LLVMValueRef muld = emit_read_operand(b, i32, &insn->ops[1], ea1, s, regs, mem);
+        LLVMValueRef add  = emit_read_operand(b, i32, &insn->ops[2], ea2, s, regs, mem);
+
+        /* Extend to 64-bit signed, multiply, add */
+        LLVMValueRef mulr64 = LLVMBuildSExt(b, mulr, i64, "mr64");
+        LLVMValueRef muld64 = LLVMBuildSExt(b, muld, i64, "md64");
+        LLVMValueRef prod64 = LLVMBuildMul(b, mulr64, muld64, "prod");
+        LLVMValueRef add64  = LLVMBuildSExt(b, add, i64, "add64");
+        LLVMValueRef res64  = LLVMBuildAdd(b, prod64, add64, "res64");
+
+        /* Split to lo/hi */
+        LLVMValueRef r_lo = LLVMBuildTrunc(b, res64, i32, "rlo");
+        LLVMValueRef r_hi = LLVMBuildTrunc(b, LLVMBuildLShr(b, res64,
+                                LLVMConstInt(i64, 32, 0), "rsh"), i32, "rhi");
+
+        /* Write destination quadword */
+        if (insn->ops[3].kind == JITBLK_REGISTER) {
+            shadow_set(s, insn->ops[3].reg,             r_lo);
+            shadow_set(s, (insn->ops[3].reg + 1) & 15, r_hi);
+        } else {
+            LLVMValueRef ea_lo = ea3;
+            LLVMValueRef ea_hi = LLVMBuildAdd(b, ea_lo, LLVMConstInt(i32, 4, 0), "eadhi");
+            emit_mem_store(b, i32, mem, ea_lo, r_lo, 4);
+            emit_mem_store(b, i32, mem, ea_hi, r_hi, 4);
+        }
+
+        /* CC: N from hi bit31, Z from (lo|hi)==0, V=0, C=0 */
+        LLVMValueRef n_f = LLVMBuildICmp(b, LLVMIntSLT, r_hi, zero32, "n");
+        LLVMValueRef lz  = LLVMBuildICmp(b, LLVMIntEQ,  r_lo, zero32, "lz");
+        LLVMValueRef hz  = LLVMBuildICmp(b, LLVMIntEQ,  r_hi, zero32, "hz");
+        LLVMValueRef z_f = LLVMBuildAnd(b, lz, hz, "z");
+        LLVMValueRef pn  = LLVMBuildSelect(b, n_f, LLVMConstInt(i32, 0x08, 0), zero32, "pn");
+        LLVMValueRef pz  = LLVMBuildSelect(b, z_f, LLVMConstInt(i32, 0x04, 0), zero32, "pz");
+        cc = LLVMBuildOr(b, pn, pz, "cc");
+        build_psl_update(b, i32, v_psl, cc);
+        return;
+    }
+
+    /* EDIV divr.rl, divd.rq, quo.wl, rem.wl  :  64-bit divide */
+    case VAX_OPC_EDIV: {
+        LLVMContextRef lctx = LLVMGetTypeContext(i32);
+        LLVMTypeRef i64  = LLVMInt64TypeInContext(lctx);
+        LLVMTypeRef i1   = LLVMInt1TypeInContext(lctx);
+        LLVMValueRef zero32 = LLVMConstInt(i32, 0, 0);
+        LLVMValueRef zero64 = LLVMConstInt(i64, 0, 0);
+
+        ea0 = emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem);
+        ea1 = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
+        LLVMValueRef ea2 = emit_operand_ea(b, i32, &insn->ops[2], s, regs, mem);
+        LLVMValueRef ea3 = emit_operand_ea(b, i32, &insn->ops[3], s, regs, mem);
+
+        LLVMValueRef divr = emit_read_operand(b, i32, &insn->ops[0], ea0, s, regs, mem);
+
+        /* Read dividend quadword */
+        LLVMValueRef dvd_lo, dvd_hi;
+        if (insn->ops[1].kind == JITBLK_REGISTER) {
+            dvd_lo = shadow_get(b, i32, s, insn->ops[1].reg,             regs);
+            dvd_hi = shadow_get(b, i32, s, (insn->ops[1].reg + 1) & 15, regs);
+        } else {
+            LLVMValueRef ea_lo = ea1;
+            LLVMValueRef ea_hi = LLVMBuildAdd(b, ea_lo, LLVMConstInt(i32, 4, 0), "eahi");
+            dvd_lo = emit_mem_load(b, i32, mem, ea_lo, 4);
+            dvd_hi = emit_mem_load(b, i32, mem, ea_hi, 4);
+        }
+
+        /* Build 64-bit dividend */
+        LLVMValueRef lo64 = LLVMBuildZExt(b, dvd_lo, i64, "lo64");
+        LLVMValueRef hi64 = LLVMBuildShl(b, LLVMBuildZExt(b, dvd_hi, i64, "hi64e"),
+                                          LLVMConstInt(i64, 32, 0), "hi64");
+        LLVMValueRef dvd64 = LLVMBuildOr(b, lo64, hi64, "dvd64");
+
+        /* Check for divide by zero */
+        LLVMValueRef is_zero = LLVMBuildICmp(b, LLVMIntEQ, divr, zero32, "dz");
+
+        /* |divisor| and |dividend| */
+        LLVMValueRef divr_neg = LLVMBuildICmp(b, LLVMIntSLT, divr, zero32, "dn");
+        LLVMValueRef abs_divr = LLVMBuildSelect(b, divr_neg,
+                                    LLVMBuildNeg(b, divr, "nd"), divr, "ad");
+        LLVMValueRef abs_divr64 = LLVMBuildZExt(b, abs_divr, i64, "ad64");
+
+        LLVMValueRef dvd_neg = LLVMBuildICmp(b, LLVMIntSLT, dvd64, zero64, "dvn");
+        LLVMValueRef abs_dvd = LLVMBuildSelect(b, dvd_neg,
+                                    LLVMBuildNeg(b, dvd64, "ndvd"), dvd64, "advd");
+
+        /* Check if quotient would overflow: (|dvd| >> 32) >= |divr| */
+        LLVMValueRef dvd_hi_u = LLVMBuildLShr(b, abs_dvd, LLVMConstInt(i64, 32, 0), "dvhi");
+        LLVMValueRef overflow = LLVMBuildICmp(b, LLVMIntUGE, dvd_hi_u, abs_divr64, "ovf");
+        LLVMValueRef bad = LLVMBuildOr(b, is_zero, overflow, "bad");
+
+        /* Safe divisor for division (avoid UB, use 1 when bad) */
+        LLVMValueRef safe_divr = LLVMBuildSelect(b, bad,
+                                     LLVMConstInt(i64, 1, 0), abs_divr64, "sd");
+
+        /* Unsigned division of absolute values */
+        LLVMValueRef quo_u = LLVMBuildUDiv(b, abs_dvd, safe_divr, "qu");
+        LLVMValueRef rem_u = LLVMBuildURem(b, abs_dvd, safe_divr, "ru");
+
+        /* Apply signs */
+        LLVMValueRef dvd_hi_sign = LLVMBuildICmp(b, LLVMIntSLT, dvd_hi,
+                                       zero32, "dhs");
+        LLVMValueRef sign_diff = LLVMBuildXor(b, divr_neg, dvd_hi_sign, "sdif");
+        LLVMValueRef quo_s = LLVMBuildTrunc(b, quo_u, i32, "qs");
+        LLVMValueRef quo_neg = LLVMBuildSelect(b, sign_diff,
+                                   LLVMBuildNeg(b, quo_s, "qn"), quo_s, "qf");
+        LLVMValueRef rem_s = LLVMBuildTrunc(b, rem_u, i32, "rs");
+        LLVMValueRef rem_neg = LLVMBuildSelect(b, dvd_hi_sign,
+                                   LLVMBuildNeg(b, rem_s, "rn"), rem_s, "rf");
+
+        /* On bad: quo = dvd_lo, rem = 0 */
+        LLVMValueRef quo_final = LLVMBuildSelect(b, bad, dvd_lo, quo_neg, "qfin");
+        LLVMValueRef rem_final = LLVMBuildSelect(b, bad, zero32, rem_neg, "rfin");
+
+        /* Write quotient and remainder */
+        emit_write_operand(b, i32, &insn->ops[2], ea2, quo_final, s, regs, mem);
+        emit_write_operand(b, i32, &insn->ops[3], ea3, rem_final, s, regs, mem);
+
+        /* CC: N,Z from quotient, V if bad, C=0 */
+        LLVMValueRef n_f = LLVMBuildICmp(b, LLVMIntSLT, quo_final, zero32, "n");
+        LLVMValueRef z_f = LLVMBuildICmp(b, LLVMIntEQ,  quo_final, zero32, "z");
+        LLVMValueRef pn  = LLVMBuildSelect(b, n_f, LLVMConstInt(i32, 0x08, 0), zero32, "pn");
+        LLVMValueRef pz  = LLVMBuildSelect(b, z_f, LLVMConstInt(i32, 0x04, 0), zero32, "pz");
+        LLVMValueRef pv  = LLVMBuildSelect(b, bad, LLVMConstInt(i32, 0x02, 0), zero32, "pv");
+        cc = LLVMBuildOr(b, LLVMBuildOr(b, pn, pz, "cc1"), pv, "cc");
+        build_psl_update(b, i32, v_psl, cc);
+        (void)i1;
+        return;
+    }
+
+    /* EXTZV pos.rl, size.rb, base.vb, dst.wl — C helper call */
+    case VAX_OPC_EXTZV: {
+        LLVMTypeRef ptr = LLVMPointerTypeInContext(LLVMGetTypeContext(i32), 0);
+        /* Spill all shadows before calling C helper */
+        shadow_spill(b, i32, s, regs);
+
+        LLVMValueRef pos_val  = emit_read_operand(b, i32, &insn->ops[0], 
+                                    emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem),
+                                    s, regs, mem);
+        LLVMValueRef size_val = emit_read_operand(b, i32, &insn->ops[1],
+                                    emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem),
+                                    s, regs, mem);
+
+        /* base operand: register mode → pass (1, reg_num), memory → (0, address) */
+        LLVMValueRef base_is_reg, base_val;
+        if (insn->ops[2].kind == JITBLK_REGISTER) {
+            base_is_reg = LLVMConstInt(i32, 1, 0);
+            base_val    = LLVMConstInt(i32, (unsigned)insn->ops[2].reg, 0);
+        } else {
+            base_is_reg = LLVMConstInt(i32, 0, 0);
+            base_val    = emit_read_operand(b, i32, &insn->ops[2],
+                              emit_operand_ea(b, i32, &insn->ops[2], s, regs, mem),
+                              s, regs, mem);
+        }
+
+        /* dst operand: register mode → (1, reg_num), memory → (0, address) */
+        LLVMValueRef dst_is_reg, dst_val;
+        if (insn->ops[3].kind == JITBLK_REGISTER) {
+            dst_is_reg = LLVMConstInt(i32, 1, 0);
+            dst_val    = LLVMConstInt(i32, (unsigned)insn->ops[3].reg, 0);
+        } else {
+            dst_is_reg = LLVMConstInt(i32, 0, 0);
+            dst_val    = emit_operand_ea(b, i32, &insn->ops[3], s, regs, mem);
+            if (!dst_val) dst_val = LLVMConstInt(i32, 0, 0);
+        }
+
+        /* Declare and call helper */
+        LLVMModuleRef mod = LLVMGetGlobalParent(LLVMGetBasicBlockParent(
+                                LLVMGetInsertBlock(b)));
+        LLVMTypeRef parms[8] = { ptr, ptr, ptr, i32, i32, i32, i32, i32, };
+        LLVMTypeRef fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(
+                                LLVMGetTypeContext(i32)), parms, 8, 0);
+        LLVMValueRef ext_fn = LLVMAddFunction(mod, "vax_jit_extzv_helper", fn_ty);
+
+        LLVMValueRef args[8] = { regs, v_psl, mem,
+                                  pos_val, size_val, base_is_reg, base_val,
+                                  dst_is_reg };
+        /* Need 9th arg but helper takes 9 params, let me fix... */
+        /* Actually the signature has 9 params. Let me redo. */
+        LLVMTypeRef parms9[9] = { ptr, ptr, ptr, i32, i32, i32, i32, i32, i32 };
+        fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(
+                    LLVMGetTypeContext(i32)), parms9, 9, 0);
+        /* Remove the one we already added and re-add with correct type.
+           Actually LLVMAddFunction will reuse the existing one if names match.
+           Let's use a different approach: just build the correct one. */
+        LLVMDeleteFunction(ext_fn);
+        ext_fn = LLVMAddFunction(mod, "vax_jit_extzv_helper", fn_ty);
+        LLVMValueRef args9[9] = { regs, v_psl, mem,
+                                   pos_val, size_val, base_is_reg, base_val,
+                                   dst_is_reg, dst_val };
+        LLVMBuildCall2(b, fn_ty, ext_fn, args9, 9, "");
+
+        /* Invalidate all shadows after helper call */
+        shadow_clear(s);
+        return;
+    }
+
+    /* INSV src.rl, pos.rl, size.rb, base.vb — C helper call */
+    case VAX_OPC_INSV: {
+        LLVMTypeRef ptr = LLVMPointerTypeInContext(LLVMGetTypeContext(i32), 0);
+        shadow_spill(b, i32, s, regs);
+
+        LLVMValueRef src_val = emit_read_operand(b, i32, &insn->ops[0],
+                                   emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem),
+                                   s, regs, mem);
+        LLVMValueRef pos_val = emit_read_operand(b, i32, &insn->ops[1],
+                                   emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem),
+                                   s, regs, mem);
+        LLVMValueRef size_val = emit_read_operand(b, i32, &insn->ops[2],
+                                    emit_operand_ea(b, i32, &insn->ops[2], s, regs, mem),
+                                    s, regs, mem);
+
+        LLVMValueRef base_is_reg, base_val;
+        if (insn->ops[3].kind == JITBLK_REGISTER) {
+            base_is_reg = LLVMConstInt(i32, 1, 0);
+            base_val    = LLVMConstInt(i32, (unsigned)insn->ops[3].reg, 0);
+        } else {
+            base_is_reg = LLVMConstInt(i32, 0, 0);
+            base_val    = emit_read_operand(b, i32, &insn->ops[3],
+                              emit_operand_ea(b, i32, &insn->ops[3], s, regs, mem),
+                              s, regs, mem);
+        }
+
+        LLVMModuleRef mod = LLVMGetGlobalParent(LLVMGetBasicBlockParent(
+                                LLVMGetInsertBlock(b)));
+        LLVMTypeRef parms[8] = { ptr, ptr, ptr, i32, i32, i32, i32, i32 };
+        LLVMTypeRef fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(
+                                LLVMGetTypeContext(i32)), parms, 8, 0);
+        LLVMValueRef ext_fn = LLVMAddFunction(mod, "vax_jit_insv_helper", fn_ty);
+        LLVMValueRef args[8] = { regs, v_psl, mem,
+                                  src_val, pos_val, size_val,
+                                  base_is_reg, base_val };
+        LLVMBuildCall2(b, fn_ty, ext_fn, args, 8, "");
+        shadow_clear(s);
+        return;
+    }
+
+    /* MOVC3 len.rw, srcaddr.ab, dstaddr.ab — C helper call */
+    case VAX_OPC_MOVC3: {
+        LLVMTypeRef ptr = LLVMPointerTypeInContext(LLVMGetTypeContext(i32), 0);
+        shadow_spill(b, i32, s, regs);
+
+        LLVMValueRef len_val = emit_read_operand(b, i32, &insn->ops[0],
+                                   emit_operand_ea(b, i32, &insn->ops[0], s, regs, mem),
+                                   s, regs, mem);
+        /* srcaddr and dstaddr are address operands (.ab) — we need the EA, not the value */
+        LLVMValueRef src_ea = emit_operand_ea(b, i32, &insn->ops[1], s, regs, mem);
+        LLVMValueRef dst_ea = emit_operand_ea(b, i32, &insn->ops[2], s, regs, mem);
+        if (!src_ea) src_ea = emit_read_operand(b, i32, &insn->ops[1], NULL, s, regs, mem);
+        if (!dst_ea) dst_ea = emit_read_operand(b, i32, &insn->ops[2], NULL, s, regs, mem);
+
+        LLVMModuleRef mod = LLVMGetGlobalParent(LLVMGetBasicBlockParent(
+                                LLVMGetInsertBlock(b)));
+        LLVMTypeRef parms[6] = { ptr, ptr, ptr, i32, i32, i32 };
+        LLVMTypeRef fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(
+                                LLVMGetTypeContext(i32)), parms, 6, 0);
+        LLVMValueRef ext_fn = LLVMAddFunction(mod, "vax_jit_movc3_helper", fn_ty);
+        LLVMValueRef args[6] = { regs, v_psl, mem, len_val, src_ea, dst_ea };
+        LLVMBuildCall2(b, fn_ty, ext_fn, args, 6, "");
+        shadow_clear(s);
         return;
     }
 
@@ -1654,6 +2168,42 @@ void vax_jit_llvm_register_call_helpers(void *calls_fn, void *ret_fn)
     if (err) {
         char *msg = LLVMGetErrorMessage(err);
         fprintf(stderr, "vax_jit: failed to register call helpers: %s\n", msg);
+        LLVMDisposeErrorMessage(msg);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* EXTZV/INSV/MOVC3 helper registration                                */
+/* ------------------------------------------------------------------ */
+
+void vax_jit_llvm_register_misc_helpers(void *extzv_fn, void *insv_fn, void *movc3_fn)
+{
+    LLVMOrcExecutionSessionRef es       = LLVMOrcLLJITGetExecutionSession(jit);
+    LLVMOrcJITDylibRef         main_lib = LLVMOrcLLJITGetMainJITDylib(jit);
+
+    LLVMJITSymbolFlags flags;
+    flags.GenericFlags = (uint8_t)(LLVMJITSymbolGenericFlagsExported |
+                                   LLVMJITSymbolGenericFlagsCallable);
+    flags.TargetFlags  = 0;
+
+    LLVMOrcCSymbolMapPair syms[3];
+    syms[0].Name = LLVMOrcExecutionSessionIntern(es, "vax_jit_extzv_helper");
+    syms[0].Sym.Address = (LLVMOrcExecutorAddress)(uintptr_t)extzv_fn;
+    syms[0].Sym.Flags   = flags;
+
+    syms[1].Name = LLVMOrcExecutionSessionIntern(es, "vax_jit_insv_helper");
+    syms[1].Sym.Address = (LLVMOrcExecutorAddress)(uintptr_t)insv_fn;
+    syms[1].Sym.Flags   = flags;
+
+    syms[2].Name = LLVMOrcExecutionSessionIntern(es, "vax_jit_movc3_helper");
+    syms[2].Sym.Address = (LLVMOrcExecutorAddress)(uintptr_t)movc3_fn;
+    syms[2].Sym.Flags   = flags;
+
+    LLVMOrcMaterializationUnitRef mu = LLVMOrcAbsoluteSymbols(syms, 3);
+    LLVMErrorRef err = LLVMOrcJITDylibDefine(main_lib, mu);
+    if (err) {
+        char *msg = LLVMGetErrorMessage(err);
+        fprintf(stderr, "vax_jit: failed to register misc helpers: %s\n", msg);
         LLVMDisposeErrorMessage(msg);
     }
 }

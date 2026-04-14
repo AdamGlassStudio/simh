@@ -115,6 +115,10 @@ void *vax_jit_llvm_compile_block (VaxJITBlock *blk, int32_t *sim_interval);
    ret_fn:   pointer to vax_jit_ret_helper_impl                             */
 void vax_jit_llvm_register_call_helpers (void *calls_fn, void *ret_fn);
 
+/* Register C helper functions for EXTZV, INSV, MOVC3.
+   Must be called after vax_jit_llvm_init(). */
+void vax_jit_llvm_register_misc_helpers (void *extzv_fn, void *insv_fn, void *movc3_fn);
+
 /* Execute an already-compiled block function pointer. */
 void vax_jit_llvm_run_block (void *fn, int32_t *regs, int32_t *psl,
                               int32_t *mem, int32_t *sim_interval);

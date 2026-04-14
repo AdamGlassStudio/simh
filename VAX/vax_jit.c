@@ -336,6 +336,153 @@ void vax_jit_ret_helper_impl(int32_t *regs, int32_t *psl, int32_t *mem)
     regs[15] = ret_pc;
 }
 
+/* ------------------------------------------------------------------ */
+/* EXTZV C helper: extract zero-extended bit field                     */
+/* regs[]: R0-R15, psl: &PSL, mem: M[]                                */
+/* ops[0]=pos(rl), ops[1]=size(rb), ops[2]=base(.vb reg#/memflag),    */
+/*   ops[3]=base value/address, ops[4]=dst spec, ops[5]=dst rn/addr   */
+/* ------------------------------------------------------------------ */
+
+void vax_jit_extzv_helper_impl(int32_t *regs, int32_t *psl,
+                                int32_t *mem,
+                                int32_t pos, int32_t size,
+                                int32_t base_is_reg, int32_t base_val,
+                                int32_t dst_is_reg, int32_t dst_rn_or_addr)
+{
+    int32_t r;
+    uint32_t wd;
+
+    if (size == 0) {
+        r = 0;
+    } else if (size > 32) {
+        /* reserved operand fault: bail to interpreter by not writing result */
+        return;
+    } else if (base_is_reg) {
+        int32_t rn = base_val;   /* register number */
+        wd = (uint32_t)regs[rn];
+        if (pos > 0 && pos < 32) {
+            if ((pos + size) > 32 && (rn + 1) < 14) {
+                uint32_t wd1 = (uint32_t)regs[(rn + 1) & 0xF];
+                wd = (wd >> pos) | (wd1 << (32 - pos));
+            } else {
+                wd = wd >> pos;
+            }
+        }
+        r = (int32_t)(wd & ((size == 32) ? 0xFFFFFFFFu : ((1u << size) - 1)));
+    } else {
+        int32_t ba = base_val + (pos >> 3);
+        int32_t bit_pos = (pos & 7) | ((ba & 3) << 3);
+        ba = ba & ~3;
+        wd = (uint32_t)mem[ba >> 2];
+        if ((size + bit_pos) > 32) {
+            uint32_t wd1 = (uint32_t)mem[(ba + 4) >> 2];
+            if (bit_pos)
+                wd = (wd >> bit_pos) | (wd1 << (32 - bit_pos));
+        } else if (bit_pos) {
+            wd = wd >> bit_pos;
+        }
+        r = (int32_t)(wd & ((size == 32) ? 0xFFFFFFFFu : ((1u << size) - 1)));
+    }
+
+    /* Write destination */
+    if (dst_is_reg) {
+        regs[dst_rn_or_addr] = r;
+    } else {
+        mem[dst_rn_or_addr >> 2] = r;
+    }
+
+    /* CC: N,Z from longword result, V=0, C preserved */
+    int32_t cc_val = *psl & 1;  /* preserve C */
+    if (r & 0x80000000)
+        cc_val |= 0x08;        /* N */
+    else if (r == 0)
+        cc_val |= 0x04;        /* Z */
+    *psl = (*psl & ~0xF) | cc_val;
+}
+
+/* ------------------------------------------------------------------ */
+/* INSV C helper: insert bit field                                    */
+/* ------------------------------------------------------------------ */
+
+void vax_jit_insv_helper_impl(int32_t *regs, int32_t *psl,
+                               int32_t *mem,
+                               int32_t src, int32_t pos, int32_t size,
+                               int32_t base_is_reg, int32_t base_val)
+{
+    uint32_t mask, val;
+    int32_t ba;
+
+    if (size == 0)
+        return;
+    if (size > 32)
+        return;  /* reserved operand fault: bail */
+
+    if (base_is_reg) {
+        int32_t rn = base_val;  /* register number */
+        if ((uint32_t)pos > 31)
+            return;  /* reserved operand fault */
+        if ((pos + size) > 32 && (rn + 1) < 14) {
+            mask = (size == 32) ? 0xFFFFFFFFu : ((1u << (pos + size - 32)) - 1);
+            val = (uint32_t)src >> (32 - pos);
+            regs[(rn + 1) & 0xF] = (regs[(rn + 1) & 0xF] & ~(int32_t)mask)
+                                    | ((int32_t)val & (int32_t)mask);
+        }
+        mask = ((size == 32) ? 0xFFFFFFFFu : ((1u << size) - 1)) << pos;
+        val = (uint32_t)src << pos;
+        regs[rn] = (regs[rn] & ~(int32_t)mask) | ((int32_t)val & (int32_t)mask);
+    } else {
+        ba = base_val + (pos >> 3);
+        pos = (pos & 7) | ((ba & 3) << 3);
+        ba = ba & ~3;
+        int32_t wd = mem[ba >> 2];
+        if ((size + pos) > 32) {
+            int32_t wd1 = mem[(ba + 4) >> 2];
+            mask = (size == 32) ? 0xFFFFFFFFu : ((1u << (pos + size - 32)) - 1);
+            val = (uint32_t)src >> (32 - pos);
+            mem[(ba + 4) >> 2] = (wd1 & ~(int32_t)mask) | ((int32_t)val & (int32_t)mask);
+        }
+        mask = ((size == 32) ? 0xFFFFFFFFu : ((1u << size) - 1)) << pos;
+        val = (uint32_t)src << pos;
+        mem[ba >> 2] = (wd & ~(int32_t)mask) | ((int32_t)val & (int32_t)mask);
+    }
+    /* INSV does not set CC */
+}
+
+/* ------------------------------------------------------------------ */
+/* MOVC3 C helper: move character string                              */
+/* ------------------------------------------------------------------ */
+
+void vax_jit_movc3_helper_impl(int32_t *regs, int32_t *psl,
+                                int32_t *mem,
+                                int32_t len, int32_t srcaddr, int32_t dstaddr)
+{
+    int32_t i;
+    uint8_t *bmem = (uint8_t *)mem;
+
+    /* Copy len bytes */
+    if (len > 0) {
+        if ((uint32_t)srcaddr < (uint32_t)dstaddr) {
+            /* Backward copy to handle overlap */
+            for (i = len - 1; i >= 0; i--)
+                bmem[(uint32_t)(dstaddr + i)] = bmem[(uint32_t)(srcaddr + i)];
+        } else {
+            for (i = 0; i < len; i++)
+                bmem[(uint32_t)(dstaddr + i)] = bmem[(uint32_t)(srcaddr + i)];
+        }
+    }
+
+    /* Set registers per VAX architecture */
+    regs[0] = 0;                    /* R0 = 0 (remaining length) */
+    regs[1] = srcaddr + len;        /* R1 = srcaddr + len */
+    regs[2] = 0;                    /* R2 = 0 */
+    regs[3] = dstaddr + len;        /* R3 = dstaddr + len */
+    regs[4] = 0;                    /* R4 = 0 */
+    regs[5] = 0;                    /* R5 = 0 */
+
+    /* CC: Z=1 (MOVC3 always sets CC_Z for equal lengths) */
+    *psl = (*psl & ~0xF) | 0x04;   /* N=0, Z=1, V=0, C=0 */
+}
+
 int vax_jit_init(void)
 {
     vax_jit_llvm_set_ir_dump(vax_jit_ir_dump);
@@ -344,6 +491,10 @@ int vax_jit_init(void)
     vax_jit_llvm_register_call_helpers(
         (void *)vax_jit_calls_helper_impl,
         (void *)vax_jit_ret_helper_impl);
+    vax_jit_llvm_register_misc_helpers(
+        (void *)vax_jit_extzv_helper_impl,
+        (void *)vax_jit_insv_helper_impl,
+        (void *)vax_jit_movc3_helper_impl);
     return 0;
 }
 void vax_jit_destroy(void) { vax_jit_llvm_destroy(); }
@@ -573,7 +724,13 @@ static int always_block_path(int32 opc)
         || opc == MOVAB || opc == MOVAL || opc == PUSHAB || opc == PUSHAL
         || opc == ADDL3 || opc == SUBL3
         || opc == BISL3 || opc == BICL3 || opc == XORL3
-        || opc == PUSHR || opc == MOVPSL;
+        || opc == PUSHR || opc == MOVPSL
+        || opc == MOVZBW || opc == MOVF || opc == CLRQ
+        || opc == ADWC || opc == SBWC || opc == ADAWI
+        || opc == POPR
+        || opc == ASHQ || opc == EMUL || opc == EDIV
+        || opc == EXTZV || opc == INSV
+        || opc == MOVC3;
 }
 
 /* ------------------------------------------------------------------ */
@@ -606,10 +763,20 @@ static uint8_t vax_jit_scan_op_lnt(int32_t opc, int op_idx)
     case MOVB:   return 1;
     case MOVW:   return 2;
     case PUSHR:  return 2;   /* mask is a word */
+    case POPR:   return 2;   /* mask is a word */
     case MOVZBL: return (op_idx == 0) ? 1 : 4;
     case MOVZWL: return (op_idx == 0) ? 2 : 4;
+    case MOVZBW: return (op_idx == 0) ? 1 : 2;
     case ASHL:   return (op_idx == 0) ? 1 : 4;
     case MOVQ:   return 8;
+    case CLRQ:   return 8;
+    case ASHQ:   return (op_idx == 0) ? 1 : 8;
+    case ADAWI:  return 2;
+    case EMUL:   return (op_idx <= 2) ? 4 : 8;
+    case EDIV:   return (op_idx == 1) ? 8 : 4;
+    case EXTZV:  return (op_idx == 1 || op_idx == 2) ? 1 : 4;
+    case INSV:   return (op_idx == 2 || op_idx == 3) ? 1 : 4;
+    case MOVC3:  return (op_idx == 0) ? 2 : 1;  /* len is word, addrs are .ab (byte-address operands) */
     default:     return 4;
     }
 }
@@ -803,9 +970,11 @@ void vax_jit_scan_block(int32_t start_pc, VaxJITBlock *blk, int32_t *mem)
                     break;
                 }
 
-                /* Callee address: must be PC-relative (reg==15) so the address
-                   is a compile-time constant already stored in ops[1].imm. */
-                if (!(ops[1].kind == JITOPK_DISP && ops[1].reg == nPC)) {
+                /* Callee address: must be a compile-time constant.
+                   Accept PC-relative displacement (W^/L^ in assembly) or
+                   absolute address (0x9F mode, as emitted by compilers/as). */
+                if (!((ops[1].kind == JITOPK_DISP && ops[1].reg == nPC) ||
+                      ops[1].kind == JITOPK_ABSOLUTE)) {
                     if (first_stop_opc < 0) first_stop_opc = opc;
                     break;
                 }
@@ -901,9 +1070,9 @@ void vax_jit_scan_block(int32_t start_pc, VaxJITBlock *blk, int32_t *mem)
             insn.ops[i] = to_blk_op(&op, op_lnt);
         }
 
-        /* PUSHR: mask must be a compile-time constant (literal or immediate).
+        /* PUSHR/POPR: mask must be a compile-time constant (literal or immediate).
            A register-mode mask requires a runtime loop we don't generate. */
-        if (ok && opc == PUSHR && insn.ops[0].kind == JITBLK_REGISTER) {
+        if (ok && (opc == PUSHR || opc == POPR) && insn.ops[0].kind == JITBLK_REGISTER) {
             if (first_stop_opc < 0) first_stop_opc = opc;
             ok = 0;
         }
@@ -937,14 +1106,24 @@ int vax_jit_noperands(int32 opc)
     case BISL3: case BICL3: case XORL3:
         return DR_GETNSP(drom[opc][0]);
     case MOVB: case MOVW:
-    case MOVZBL: case MOVZWL:
+    case MOVZBL: case MOVZWL: case MOVZBW:
     case PUSHL:
-    case ASHL: case MOVQ:
+    case ASHL: case ASHQ:
+    case MOVQ: case CLRQ:
     case MOVAB: case MOVAL:
     case PUSHAB: case PUSHAL:
         return DR_GETNSP(drom[opc][0]);
-    case PUSHR:
+    case PUSHR: case POPR:
     case MOVPSL:
+        return DR_GETNSP(drom[opc][0]);
+    case MOVF:
+    case ADWC: case SBWC:
+    case ADAWI:
+        return DR_GETNSP(drom[opc][0]);
+    case EMUL: case EDIV:
+    case EXTZV: case INSV:
+        return DR_GETNSP(drom[opc][0]);
+    case MOVC3:
         return DR_GETNSP(drom[opc][0]);
     default:
         return -1;
