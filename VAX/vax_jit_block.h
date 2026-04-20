@@ -61,7 +61,7 @@ typedef struct {
     uint8_t     branch_cond;   /* VaxBCond value */
 } VaxJITBlkInsn;
 
-#define VAX_JIT_MAX_INSNS 32
+#define VAX_JIT_MAX_INSNS 64
 
 typedef struct {
     int           n_insns;
@@ -70,4 +70,21 @@ typedef struct {
     int           has_back_edge;   /* 1 if any intra-region backward branch found */
     VaxJITBlkInsn insns[VAX_JIT_MAX_INSNS];
 } VaxJITBlock;
+
+/* ---- Multi-segment compile result ---- */
+
+/* One compiled function entry: an (entry_pc, fn, n_insns) tuple. */
+typedef struct {
+    int32_t entry_pc;
+    void   *fn;
+    int     n_insns;  /* instructions compiled into this segment */
+} VaxJITCompileEntry;
+
+/* Up to VAX_JIT_MAX_SEGMENTS entries per scan region (one per CALLS + 1). */
+#define VAX_JIT_MAX_SEGMENTS 4
+
+typedef struct {
+    VaxJITCompileEntry entries[VAX_JIT_MAX_SEGMENTS];
+    int                n_entries;
+} VaxJITCompileResult;
 #endif /* VAX_JIT_BLOCK_H */

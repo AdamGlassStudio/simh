@@ -1689,18 +1689,20 @@ static void emit_sim_interval_dec(LLVMBuilderRef b, LLVMTypeRef i32,
     LLVMBuildStore(b, nval, v_siv);
 }
 
-/* Compile all instructions in the block to a single native function.
-   Supports multi-BB regions: intra-block branches become LLVM br
-   instructions.  Back-edges check sim_interval and exit if <= 0.
-   Writes the appropriate guest PC into regs[15] at every exit point.
+/* Compile instructions blk->insns[start_insn..end_insn) as a single native
+   function.  entry_pc is the guest PC of insns[start_insn] and is used for
+   the function symbol name.  Supports multi-BB regions, back-edges, and
+   CALLS (which exits the segment; re-entry is a separate segment).
    Returns NULL on error.                                               */
-static void *compile_block(VaxJITBlock *blk, int32_t *sim_interval_ptr)
+static void *compile_block(VaxJITBlock *blk, int start_insn, int end_insn,
+                            int32_t entry_pc, int32_t *sim_interval_ptr)
 {
     static uint32_t bcnt = 0;
     char sym[32];
     int i;
-    int32_t first_opc = blk->n_insns > 0 ? blk->insns[0].opc : 0;
+    int32_t first_opc = (end_insn > start_insn) ? blk->insns[start_insn].opc : 0;
     snprintf(sym, sizeof(sym), "blk_%02x_%u", (uint32_t)(uint8_t)first_opc, bcnt++);
+    (void)entry_pc; /* used for naming in future; suppress unused-variable warning */
 
     LLVMTypeRef i32  = LLVMInt32TypeInContext(ctx);
     LLVMTypeRef ptr  = LLVMPointerTypeInContext(ctx, 0);
@@ -1719,22 +1721,25 @@ static void *compile_block(VaxJITBlock *blk, int32_t *sim_interval_ptr)
 
     /* ---- Pre-pass: build BB map ---- */
 
-    /* Collect all insn_pcs for membership test */
+    /* Collect insn_pcs for the range [start_insn, end_insn) */
     int32_t insn_pcs[VAX_JIT_MAX_INSNS];
-    for (i = 0; i < blk->n_insns; i++)
-        insn_pcs[i] = blk->insns[i].insn_pc;
+    int n_range = end_insn - start_insn;
+    for (i = 0; i < n_range; i++)
+        insn_pcs[i] = blk->insns[start_insn + i].insn_pc;
 
     /* Determine which PCs need their own LLVM basic block */
     int32_t  bb_start_pcs[MAX_BB_ENTRIES];
     int      n_bb_starts = 0;
 
     /* First instruction always starts the entry BB */
-    if (blk->n_insns > 0)
+    if (n_range > 0)
         bb_start_pcs[n_bb_starts++] = insn_pcs[0];
 
-    for (i = 0; i < blk->n_insns; i++) {
-        VaxJITBlkInsn *insn = &blk->insns[i];
+    for (i = 0; i < n_range; i++) {
+        VaxJITBlkInsn *insn = &blk->insns[start_insn + i];
         if (insn->branch_target < 0) continue;
+        /* CALLS branch_target is the return address — NOT an intra-region branch */
+        if (insn->opc == 0xFB) continue;
 
         int32_t tgt = insn->branch_target;
         int is_uncond = (insn->branch_cond == VAX_BCOND_UNCOND);
@@ -1742,7 +1747,7 @@ static void *compile_block(VaxJITBlock *blk, int32_t *sim_interval_ptr)
 
         /* Check if target is an intra-region instruction */
         int tgt_intra = 0;
-        for (j = 0; j < blk->n_insns; j++)
+        for (j = 0; j < n_range; j++)
             if (insn_pcs[j] == tgt) { tgt_intra = 1; break; }
 
         if (tgt_intra) {
@@ -1755,7 +1760,7 @@ static void *compile_block(VaxJITBlock *blk, int32_t *sim_interval_ptr)
         }
 
         /* Fall-through of a conditional branch needs a BB */
-        if (!is_uncond && i + 1 < blk->n_insns) {
+        if (!is_uncond && i + 1 < n_range) {
             int32_t ft = insn_pcs[i + 1];
             found = 0;
             for (j = 0; j < n_bb_starts; j++)
@@ -1788,16 +1793,18 @@ static void *compile_block(VaxJITBlock *blk, int32_t *sim_interval_ptr)
     }
 
     /* Create exit BBs for each unique intra-region exit target (branch targets
-       NOT in insn_pcs — exits the region) */
+       NOT in insn_pcs — exits the region).  CALLS branch_target is the return
+       address for cache re-entry, not an intra-region branch — skip it here. */
     int32_t  exit_pcs[MAX_BB_ENTRIES];
     BBEntry  exit_map[MAX_BB_ENTRIES];
     int      n_exits = 0;
-    for (i = 0; i < blk->n_insns; i++) {
-        VaxJITBlkInsn *insn = &blk->insns[i];
+    for (i = 0; i < n_range; i++) {
+        VaxJITBlkInsn *insn = &blk->insns[start_insn + i];
         if (insn->branch_target < 0) continue;
+        if (insn->opc == 0xFB) continue;  /* CALLS exits inline, not via exit BB */
         int32_t tgt = insn->branch_target;
         int j, tgt_intra = 0;
-        for (j = 0; j < blk->n_insns; j++)
+        for (j = 0; j < n_range; j++)
             if (insn_pcs[j] == tgt) { tgt_intra = 1; break; }
         if (tgt_intra) continue;
 
@@ -1843,8 +1850,8 @@ static void *compile_block(VaxJITBlock *blk, int32_t *sim_interval_ptr)
 
     int builder_terminated = 0;
 
-    for (i = 0; i < blk->n_insns; i++) {
-        VaxJITBlkInsn *insn = &blk->insns[i];
+    for (i = 0; i < n_range; i++) {
+        VaxJITBlkInsn *insn = &blk->insns[start_insn + i];
 
         /* Check if this instruction's PC starts a new BB (after the first) */
         if (i > 0) {
@@ -1868,7 +1875,63 @@ static void *compile_block(VaxJITBlock *blk, int32_t *sim_interval_ptr)
             continue;
         }
 
-        if (insn->branch_target >= 0) {
+        /* CALLS/RET must be handled before the branch_target check:
+           CALLS stores the return address in branch_target (>= 0) but is NOT
+           a branch — it exits the segment and the callee runs separately. */
+        if (insn->opc == 0xFB /* CALLS */ || insn->opc == 0x04 /* RET */) {
+            /* CALLS: spill return address into R15, call helper, then EXIT.
+               The helper sets PC = callee+2.  The callee runs via the interpreter
+               or its own JIT block.  When the callee RETs, PC = return address,
+               and a cache hit re-enters this compiled segment.
+               RET: call ret helper (tears down frame, sets PC = saved return addr),
+               then exit. */
+
+            if (insn->opc == 0xFB) {
+                /* R15 = return address (insn->branch_target); helper reads it for frame */
+                shadow_set(&shadow, 15,
+                           LLVMConstInt(i32, (uint32_t)insn->branch_target, 0));
+            }
+            shadow_spill(b, i32, &shadow, v_regs);
+
+            if (insn->opc == 0xFB) {
+                /* vax_jit_calls_helper(ptr regs, ptr psl, ptr mem, i32 argc, i32 callee) */
+                LLVMTypeRef  parms5[5] = { ptr, ptr, ptr, i32, i32 };
+                LLVMTypeRef  fn5_ty    = LLVMFunctionType(
+                                             LLVMVoidTypeInContext(ctx), parms5, 5, 0);
+                LLVMValueRef ext_fn    = LLVMAddFunction(mod,
+                                             "vax_jit_calls_helper", fn5_ty);
+
+                VaxJITBlkOp *op0 = &insn->ops[0];
+                LLVMValueRef argc_val;
+                if (op0->kind == JITBLK_LITERAL || op0->kind == JITBLK_IMMEDIATE) {
+                    argc_val = LLVMConstInt(i32, (uint32_t)op0->imm, 0);
+                } else {
+                    LLVMValueRef idx = LLVMConstInt(i32, (unsigned)op0->reg, 0);
+                    LLVMValueRef rp  = LLVMBuildGEP2(b, i32, v_regs, &idx, 1, "");
+                    argc_val = LLVMBuildLoad2(b, i32, rp, "argc");
+                }
+
+                LLVMValueRef callee_val =
+                    LLVMConstInt(i32, (uint32_t)insn->ops[1].imm, 0);
+
+                LLVMValueRef args5[5] = { v_regs, v_psl, v_mem, argc_val, callee_val };
+                LLVMBuildCall2(b, fn5_ty, ext_fn, args5, 5, "");
+                /* Helper set PC = callee+2; exit so the callee runs on its own. */
+            } else {
+                /* vax_jit_ret_helper(ptr regs, ptr psl, ptr mem) */
+                LLVMTypeRef  parms3[3] = { ptr, ptr, ptr };
+                LLVMTypeRef  fn3_ty    = LLVMFunctionType(
+                                             LLVMVoidTypeInContext(ctx), parms3, 3, 0);
+                LLVMValueRef ext_fn    = LLVMAddFunction(mod,
+                                             "vax_jit_ret_helper", fn3_ty);
+
+                LLVMValueRef args3[3] = { v_regs, v_psl, v_mem };
+                LLVMBuildCall2(b, fn3_ty, ext_fn, args3, 3, "");
+            }
+
+            LLVMBuildRetVoid(b);
+            builder_terminated = 1;
+        } else if (insn->branch_target >= 0) {
             /* Branch instruction: spill, then emit the branch */
             shadow_spill(b, i32, &shadow, v_regs);
             shadow_clear(&shadow);
@@ -1878,7 +1941,7 @@ static void *compile_block(VaxJITBlock *blk, int32_t *sim_interval_ptr)
 
             /* Is the target intra-region? */
             int j, tgt_intra = 0;
-            for (j = 0; j < blk->n_insns; j++)
+            for (j = 0; j < n_range; j++)
                 if (insn_pcs[j] == tgt) { tgt_intra = 1; break; }
 
             LLVMBasicBlockRef tgt_bb = tgt_intra
@@ -1900,7 +1963,7 @@ static void *compile_block(VaxJITBlock *blk, int32_t *sim_interval_ptr)
                         emit_pc_store(b, i32, v_regs, tgt);
                         LLVMValueRef old_iv  = LLVMBuildLoad2(b, i32, v_siv, "siv");
                         LLVMValueRef new_iv  = LLVMBuildSub(b, old_iv,
-                                                  LLVMConstInt(i32, (unsigned)blk->n_insns, 0),
+                                                  LLVMConstInt(i32, (unsigned)n_range, 0),
                                                   "sivn");
                         LLVMBuildStore(b, new_iv, v_siv);
                         LLVMValueRef expired = LLVMBuildICmp(b, LLVMIntSLE, new_iv,
@@ -1921,7 +1984,7 @@ static void *compile_block(VaxJITBlock *blk, int32_t *sim_interval_ptr)
                 LLVMValueRef cond_val = emit_branch_cond(b, i32, v_psl,
                                                           insn->branch_cond);
                 /* Fall-through BB */
-                LLVMBasicBlockRef ft_bb = (i + 1 < blk->n_insns)
+                LLVMBasicBlockRef ft_bb = (i + 1 < n_range)
                     ? bb_map_lookup(bb_map, n_bb_map, insn_pcs[i + 1])
                     : fallthrough_bb;
                 if (!ft_bb) ft_bb = fallthrough_bb;
@@ -1939,7 +2002,7 @@ static void *compile_block(VaxJITBlock *blk, int32_t *sim_interval_ptr)
                         emit_pc_store(b, i32, v_regs, tgt);
                         LLVMValueRef old_iv = LLVMBuildLoad2(b, i32, v_siv, "siv");
                         LLVMValueRef new_iv = LLVMBuildSub(b, old_iv,
-                                                LLVMConstInt(i32, (unsigned)blk->n_insns, 0),
+                                                LLVMConstInt(i32, (unsigned)n_range, 0),
                                                 "sivn");
                         LLVMBuildStore(b, new_iv, v_siv);
                         LLVMValueRef expired = LLVMBuildICmp(b, LLVMIntSLE, new_iv,
@@ -1957,58 +2020,6 @@ static void *compile_block(VaxJITBlock *blk, int32_t *sim_interval_ptr)
                 }
                 builder_terminated = 1;
             }
-        } else if (insn->opc == 0xFB /* CALLS */ || insn->opc == 0x04 /* RET */) {
-            /* CALLS/RET: emit C-helper call then exit.
-               The helpers read/write regs[] and psl directly after shadow spill. */
-
-            if (insn->opc == 0xFB) {
-                /* Set R15 = blk->fallthrough_pc (= return address stored in frame) */
-                shadow_set(&shadow, 15,
-                           LLVMConstInt(i32, (uint32_t)blk->fallthrough_pc, 0));
-            }
-            shadow_spill(b, i32, &shadow, v_regs);
-
-            /* Declare external helper functions in this module */
-            if (insn->opc == 0xFB) {
-                /* vax_jit_calls_helper(ptr regs, ptr psl, ptr mem, i32 argc, i32 callee) */
-                LLVMTypeRef  parms5[5] = { ptr, ptr, ptr, i32, i32 };
-                LLVMTypeRef  fn5_ty    = LLVMFunctionType(
-                                             LLVMVoidTypeInContext(ctx), parms5, 5, 0);
-                LLVMValueRef ext_fn    = LLVMAddFunction(mod,
-                                             "vax_jit_calls_helper", fn5_ty);
-
-                /* Compute argcount: literal/immediate → constant; register → load */
-                VaxJITBlkOp *op0 = &insn->ops[0];
-                LLVMValueRef argc_val;
-                if (op0->kind == JITBLK_LITERAL || op0->kind == JITBLK_IMMEDIATE) {
-                    argc_val = LLVMConstInt(i32, (uint32_t)op0->imm, 0);
-                } else {
-                    /* JITBLK_REGISTER: load from regs (shadow already spilled) */
-                    LLVMValueRef idx = LLVMConstInt(i32, (unsigned)op0->reg, 0);
-                    LLVMValueRef rp  = LLVMBuildGEP2(b, i32, v_regs, &idx, 1, "");
-                    argc_val = LLVMBuildLoad2(b, i32, rp, "argc");
-                }
-
-                /* ops[1] for CALLS is JITBLK_DISP+reg=15: imm = absolute callee addr */
-                LLVMValueRef callee_val =
-                    LLVMConstInt(i32, (uint32_t)insn->ops[1].imm, 0);
-
-                LLVMValueRef args5[5] = { v_regs, v_psl, v_mem, argc_val, callee_val };
-                LLVMBuildCall2(b, fn5_ty, ext_fn, args5, 5, "");
-            } else {
-                /* vax_jit_ret_helper(ptr regs, ptr psl, ptr mem) */
-                LLVMTypeRef  parms3[3] = { ptr, ptr, ptr };
-                LLVMTypeRef  fn3_ty    = LLVMFunctionType(
-                                             LLVMVoidTypeInContext(ctx), parms3, 3, 0);
-                LLVMValueRef ext_fn    = LLVMAddFunction(mod,
-                                             "vax_jit_ret_helper", fn3_ty);
-
-                LLVMValueRef args3[3] = { v_regs, v_psl, v_mem };
-                LLVMBuildCall2(b, fn3_ty, ext_fn, args3, 3, "");
-            }
-
-            LLVMBuildRetVoid(b);
-            builder_terminated = 1;
         } else {
             /* Normal non-branch instruction */
             emit_insn(b, i32, insn, &shadow, v_regs, v_psl, v_mem);
@@ -2025,9 +2036,6 @@ static void *compile_block(VaxJITBlock *blk, int32_t *sim_interval_ptr)
     }
 
     /* ---- Populate fallthrough BB ---- */
-    /* Always write fallthrough_pc here: the fall-off-end path already wrote it
-       via shadow_spill (redundant but harmless), but the conditional-branch-at-
-       end-of-region path does NOT write R15 before branching here. */
     LLVMPositionBuilderAtEnd(b, fallthrough_bb);
     emit_pc_store(b, i32, v_regs, blk->fallthrough_pc);
     LLVMBuildRetVoid(b);
@@ -2072,7 +2080,59 @@ static void *compile_block(VaxJITBlock *blk, int32_t *sim_interval_ptr)
 
 void *vax_jit_llvm_compile_block(VaxJITBlock *blk, int32_t *sim_interval)
 {
-    return compile_block(blk, sim_interval);
+    return compile_block(blk, 0, blk->n_insns, blk->region_start_pc, sim_interval);
+}
+
+/* Compile all segments in a scanned region.
+   Segments are divided by CALLS instructions: the main segment (0..calls_idx)
+   is entries[0], and each post-CALLS continuation segment is an additional entry.
+   Returns n_entries == 0 if the main segment fails to compile.                  */
+VaxJITCompileResult vax_jit_llvm_compile_block_multi(VaxJITBlock *blk,
+                                                      int32_t     *sim_interval)
+{
+    VaxJITCompileResult result;
+    result.n_entries = 0;
+
+    /* Find CALLS boundaries */
+    int calls_idx[VAX_JIT_MAX_SEGMENTS];
+    int n_calls = 0;
+    for (int i = 0; i < blk->n_insns && n_calls < VAX_JIT_MAX_SEGMENTS - 1; i++) {
+        if (blk->insns[i].opc == 0xFB)
+            calls_idx[n_calls++] = i;
+    }
+
+    /* Build segment boundaries: [seg_start[k], seg_end[k]) */
+    int seg_start[VAX_JIT_MAX_SEGMENTS];
+    int seg_end[VAX_JIT_MAX_SEGMENTS];
+    int32_t seg_entry_pc[VAX_JIT_MAX_SEGMENTS];
+    int n_segs = n_calls + 1;
+
+    seg_start[0]    = 0;
+    seg_end[0]      = (n_calls > 0) ? calls_idx[0] + 1 : blk->n_insns;
+    seg_entry_pc[0] = blk->region_start_pc;
+
+    for (int k = 0; k < n_calls; k++) {
+        seg_start[k + 1]    = calls_idx[k] + 1;
+        seg_end[k + 1]      = (k + 1 < n_calls) ? calls_idx[k + 1] + 1 : blk->n_insns;
+        seg_entry_pc[k + 1] = blk->insns[calls_idx[k]].branch_target; /* return address */
+    }
+
+    /* Compile each segment */
+    for (int k = 0; k < n_segs; k++) {
+        if (seg_start[k] >= seg_end[k]) continue;  /* empty (shouldn't happen) */
+        void *fn = compile_block(blk, seg_start[k], seg_end[k],
+                                 seg_entry_pc[k], sim_interval);
+        if (!fn) {
+            if (k == 0) return result;  /* main segment failed — give up */
+            continue;                   /* re-entry segment failed — skip it */
+        }
+        result.entries[result.n_entries].entry_pc = seg_entry_pc[k];
+        result.entries[result.n_entries].fn       = fn;
+        result.entries[result.n_entries].n_insns  = seg_end[k] - seg_start[k];
+        result.n_entries++;
+    }
+
+    return result;
 }
 
 void vax_jit_llvm_run_block(void *fn, int32_t *regs, int32_t *psl,
@@ -2087,7 +2147,8 @@ int vax_jit_llvm_exec_block(VaxJITBlock *blk, int32_t *regs,
                              int32_t *sim_interval)
 {
     typedef void (*BlockFn)(int32_t *, int32_t *, int32_t *, int32_t *);
-    BlockFn fn = (BlockFn)compile_block(blk, sim_interval);
+    BlockFn fn = (BlockFn)compile_block(blk, 0, blk->n_insns,
+                                        blk->region_start_pc, sim_interval);
     if (!fn) return 0;
     fn(regs, psl, mem, sim_interval);
     return 1;

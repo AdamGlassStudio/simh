@@ -737,15 +737,23 @@ for ( ;; ) {
 
         vax_jit_scan_block(PC, &blk, (int32_t *)M);
         if (blk.n_insns > 0) {
-            void *fn = vax_jit_llvm_compile_block(&blk, &sim_interval);
-            if (fn) {
-                vax_jit_cache_insert_n((uint32_t)blk.region_start_pc, fn,
-                                       (uint32_t)blk.n_insns);
-                vax_jit_llvm_run_block(fn, R, &PSL, (int32_t *)M, &sim_interval);
-                /* Block ran: account for instructions executed.
-                   Loop blocks also decrement sim_interval on each back-edge
-                   (liveness guarantee); this decrement handles the accounting. */
-                sim_interval = sim_interval - blk.n_insns;
+            VaxJITCompileResult cr =
+                vax_jit_llvm_compile_block_multi(&blk, &sim_interval);
+            if (cr.n_entries > 0) {
+                int j;
+                /* Register all compiled segments in the block cache.
+                   entries[0] is the main block; subsequent entries are
+                   post-CALLS re-entry points in the same scanned region. */
+                for (j = 0; j < cr.n_entries; j++)
+                    vax_jit_cache_insert_n((uint32_t)cr.entries[j].entry_pc,
+                                           cr.entries[j].fn,
+                                           (uint32_t)cr.entries[j].n_insns);
+                /* Run the main (first) compiled segment */
+                vax_jit_llvm_run_block(cr.entries[0].fn, R, &PSL,
+                                       (int32_t *)M, &sim_interval);
+                /* Account for instructions executed by the main segment.
+                   Loop blocks also decrement sim_interval on each back-edge. */
+                sim_interval = sim_interval - cr.entries[0].n_insns;
                 extra_bytes  = 0;
                 /* Sync the prefetch buffer to the updated PC */
                 ibufl = ibufh = 0;
@@ -753,9 +761,9 @@ for ( ;; ) {
                 ppc   = PC;
                 /* Sync cc from PSL so the interpreter resumes with correct CC */
                 cc = PSL & 0xF;
-                /* Telemetry */
+                /* Telemetry: count the main segment */
                 vax_jit_stats.blocks_run++;
-                vax_jit_stats.insns_jit += (uint64_t)blk.n_insns;
+                vax_jit_stats.insns_jit += (uint64_t)cr.entries[0].n_insns;
                 vax_jit_stats.size_hist[blk.n_insns < 33 ? blk.n_insns : 32]++;
                 continue;
             } else {

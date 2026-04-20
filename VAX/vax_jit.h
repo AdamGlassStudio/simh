@@ -109,6 +109,13 @@ void vax_jit_scan_block (int32_t start_pc, VaxJITBlock *blk, int32_t *mem);
    The caller owns the pointer — it remains valid until vax_jit_cache_flush(). */
 void *vax_jit_llvm_compile_block (VaxJITBlock *blk, int32_t *sim_interval);
 
+/* Compile a block, splitting at CALLS boundaries into multiple segments.
+   Each segment is compiled as an independent function.  entries[0] is the
+   main block; subsequent entries are re-entry points at post-CALLS PCs.
+   Returns a result with n_entries >= 1 on success, n_entries == 0 on failure. */
+VaxJITCompileResult vax_jit_llvm_compile_block_multi (VaxJITBlock *blk,
+                                                       int32_t     *sim_interval);
+
 /* Register C helper functions for CALLS/RET frame setup/teardown.
    Must be called after vax_jit_llvm_init() and before the first block compile.
    calls_fn: pointer to vax_jit_calls_helper_impl
