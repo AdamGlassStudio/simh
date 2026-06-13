@@ -52,3 +52,4 @@ Visual Studio Projects/*-*.sln
 gmon.out
 VAX/tests/gmon.out
 netbsd-vax/
+VAX/tests/jit/__pycache__/

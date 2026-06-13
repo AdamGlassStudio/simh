@@ -10,6 +10,7 @@
  */
 
 #include "vax_jit.h"
+#include "vax_mmu.h"
 #include <stdint.h>
 #include <string.h>
 
@@ -484,21 +485,49 @@ void vax_jit_movc3_helper_impl(int32_t *regs, int32_t *psl,
 }
 
 /* ------------------------------------------------------------------ */
-/* Memory load/store fallback helpers                                  */
+/* Memory load/store helpers (slow path: called by JIT'd code when     */
+/* the inline fast-path can't service the access — today that means    */
+/* whenever the guest MMU is on; future: also page-cross/misalign).    */
 /*                                                                     */
-/* Today these mirror the inline IR emitted by emit_mem_{load,store}:  */
-/* a direct host-memory access into M[], no MMU translation. This      */
-/* validates the helper-call plumbing for the upcoming inline-check    */
-/* fast-path work. A follow-up will swap the body for a translate-and- */
-/* check-then-access path that returns success/failure to the JIT, so  */
-/* the JIT can exit cleanly at the faulting PC on a miss.              */
+/* Strategy is "translate-or-fail": pre-validate the translation with  */
+/* fill(va, lnt, acc, &stat) which returns success/fail without doing  */
+/* ABORT/longjmp. If translation succeeds, call Read/Write — they will */
+/* not fault because we just validated the TLB. If translation fails,  */
+/* set *fault_out = 1 and return; the JIT exits at the faulting PC and */
+/* the interpreter re-executes (and re-faults through the normal       */
+/* SIMH path with the right fault_PC, fault_p1, recq unwind, etc.).    */
+/*                                                                     */
+/* Known gap: autoincrement side-effects performed in the JIT's        */
+/* register shadow BEFORE a faulting mem op are not unwound on fault.  */
+/* The interpreter's recq[] does this on its faulting re-execute, but  */
+/* the JIT has already committed the inc to shadow. This is only       */
+/* observable when MMU faults actually fire (MMU-on guests), which is  */
+/* a separate workstream from the current test/bench setup.            */
 /* ------------------------------------------------------------------ */
 
 int32_t vax_jit_mem_load_helper_impl(int32_t *regs, int32_t *psl,
                                       int32_t *mem,
-                                      int32_t va, int32_t width)
+                                      int32_t va, int32_t width,
+                                      int32_t *fault_out)
 {
-    (void)regs; (void)psl;
+    (void)regs;
+    *fault_out = 0;
+
+    if (mapen) {
+        int32_t cur = PSL_GETCUR(*psl);
+        int32_t acc = TLB_ACCR(cur);
+        int32_t stat = 0;
+
+        fill((uint32)va, width, acc, &stat);
+        if (stat) { *fault_out = 1; return 0; }
+
+        if ((va & VA_M_OFF) + width > VA_PAGSIZE) {
+            fill((uint32)(va + width - 1) & ~VA_M_OFF, width, acc, &stat);
+            if (stat) { *fault_out = 1; return 0; }
+        }
+        return Read((uint32)va, width, acc);
+    }
+
     uint32_t addr = (uint32_t)va;
     uint8_t  *mb  = (uint8_t *)mem;
     if (width == 1)
@@ -513,9 +542,28 @@ int32_t vax_jit_mem_load_helper_impl(int32_t *regs, int32_t *psl,
 
 void vax_jit_mem_store_helper_impl(int32_t *regs, int32_t *psl,
                                     int32_t *mem,
-                                    int32_t va, int32_t val, int32_t width)
+                                    int32_t va, int32_t val, int32_t width,
+                                    int32_t *fault_out)
 {
-    (void)regs; (void)psl;
+    (void)regs;
+    *fault_out = 0;
+
+    if (mapen) {
+        int32_t cur = PSL_GETCUR(*psl);
+        int32_t acc = TLB_ACCW(cur);
+        int32_t stat = 0;
+
+        fill((uint32)va, width, acc, &stat);
+        if (stat) { *fault_out = 1; return; }
+
+        if ((va & VA_M_OFF) + width > VA_PAGSIZE) {
+            fill((uint32)(va + width - 1) & ~VA_M_OFF, width, acc, &stat);
+            if (stat) { *fault_out = 1; return; }
+        }
+        Write((uint32)va, val, width, acc);
+        return;
+    }
+
     uint32_t addr = (uint32_t)va;
     uint8_t  *mb  = (uint8_t *)mem;
     if (width == 1) {

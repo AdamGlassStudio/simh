@@ -129,6 +129,16 @@ void vax_jit_llvm_register_misc_helpers (void *extzv_fn, void *insv_fn, void *mo
 /* Register C helper functions for memory load/store fallback.
    These are invoked by JIT'd code when the inline fast-path cannot
    handle an access (page cross, misalign, MMU translation needed).
+
+   Helper signatures:
+     int32_t load (regs, psl, mem, va, width, *fault_out)
+     void    store(regs, psl, mem, va, val, width, *fault_out)
+
+   *fault_out is set to 0 on success, non-zero on translation/access
+   fault. On fault, the JIT exits cleanly at the faulting PC and the
+   interpreter re-executes the instruction (and re-faults through the
+   normal SIMH path, setting fault_PC/fault_p1/etc).
+
    Must be called after vax_jit_llvm_init(). */
 void vax_jit_llvm_register_mem_helpers (void *load_fn, void *store_fn);
 

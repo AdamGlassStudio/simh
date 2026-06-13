@@ -90,10 +90,15 @@ static int32_t *mapen_ptr = NULL;
    as the inline fault-check work lands. Today it only carries cur_pc;
    helper bodies still use their existing positional parameters so this
    refactor is intentionally behavior-preserving. */
+typedef struct RegShadow RegShadow;
 typedef struct {
-    uint32_t      cur_pc;   /* PC of instruction currently being emitted */
-    LLVMValueRef  regs;     /* i32* register file param */
-    LLVMValueRef  psl;      /* i32* PSL param */
+    uint32_t          cur_pc;       /* PC of instruction currently being emitted */
+    LLVMValueRef      regs;         /* i32* register file param */
+    LLVMValueRef      psl;          /* i32* PSL param */
+    LLVMValueRef      fault_slot;   /* i32* alloca in entry BB; helper writes 0/1 */
+    LLVMBasicBlockRef fault_exit_bb;/* shared per-block: phi cur_pc, store to R15, ret */
+    LLVMValueRef      fault_pc_phi; /* phi i32 in fault_exit_bb */
+    RegShadow        *shadow;       /* current shadow state (for spilling on slow path) */
 } EmitCtx;
 
 /* ------------------------------------------------------------------ */
@@ -507,7 +512,7 @@ static int compile_tstl(void)
 /* NULL = not yet loaded; non-NULL = loaded (and possibly modified).   */
 /* ------------------------------------------------------------------ */
 
-typedef struct {
+typedef struct RegShadow {
     LLVMValueRef val[16];
 } RegShadow;
 
@@ -607,18 +612,33 @@ static LLVMValueRef emit_mmu_on_check(LLVMBuilderRef b, LLVMTypeRef i32)
     return LLVMBuildICmp(b, LLVMIntNE, v, LLVMConstInt(i32, 0, 0), "mmu_on");
 }
 
-/* Emit a memory load with inline fast-path + helper fallback.
+/* Spill all live shadow values into the regs[] memory backing.
+   Called before the slow-path helper invocation so that, on a fault
+   exit, the register file in memory reflects the JIT's working state.
+   (Note: any autoincrement side-effects already committed to shadow
+   for this instruction are NOT unwound — see vax_jit.c helper notes.) */
+static void emit_shadow_spill_for_fault(LLVMBuilderRef b, LLVMTypeRef i32,
+                                         EmitCtx *ctx)
+{
+    if (ctx->shadow)
+        shadow_spill(b, i32, ctx->shadow, ctx->regs);
+}
+
+/* Emit a memory load with inline fast-path + helper-fallback + fault exit.
    IR shape:
      %mmu_on = load *mapen != 0
-     br i1 %mmu_on, label %slow, label %fast
+     br i1 %mmu_on, %slow, %fast
    fast:                       ; MMU off: direct host-memory access
      %fv = inline load
-     br label %cont
-   slow:                       ; MMU on: call helper (does translation)
-     %sv = call vax_jit_mem_load_helper(...)
-     br label %cont
+     br %cont
+   slow:
+     <spill shadows>            ; for fault-exit visibility
+     call helper(regs, psl, mem, va, width, fault_slot)
+     %sv = ...
+     %f  = load fault_slot
+     br %f != 0, %fault_exit, %cont
    cont:
-     %v  = phi [%fv, %fast], [%sv, %slow] */
+     %v = phi [%fv, fast_end], [%sv, slow_end_ok] */
 static LLVMValueRef emit_mem_load(LLVMBuilderRef b, LLVMTypeRef i32,
                                    LLVMValueRef mem, LLVMValueRef byte_addr,
                                    int width, EmitCtx *ctx)
@@ -640,28 +660,41 @@ static LLVMValueRef emit_mem_load(LLVMBuilderRef b, LLVMTypeRef i32,
     LLVMBuildBr(b, cont);
 
     LLVMPositionBuilderAtEnd(b, slow);
+    emit_shadow_spill_for_fault(b, i32, ctx);
     LLVMModuleRef mod    = LLVMGetGlobalParent(fn);
     LLVMTypeRef   ptr    = LLVMPointerTypeInContext(lctx, 0);
-    LLVMTypeRef   parms[5] = { ptr, ptr, ptr, i32, i32 };
-    LLVMTypeRef   fn_ty  = LLVMFunctionType(i32, parms, 5, 0);
+    LLVMTypeRef   parms[6] = { ptr, ptr, ptr, i32, i32, ptr };
+    LLVMTypeRef   fn_ty  = LLVMFunctionType(i32, parms, 6, 0);
     LLVMValueRef  hfn    = LLVMGetNamedFunction(mod, "vax_jit_mem_load_helper");
     if (!hfn)
         hfn = LLVMAddFunction(mod, "vax_jit_mem_load_helper", fn_ty);
-    LLVMValueRef args[5] = { ctx->regs, ctx->psl, mem, byte_addr,
-                              LLVMConstInt(i32, (unsigned)width, 0) };
-    LLVMValueRef sv = LLVMBuildCall2(b, fn_ty, hfn, args, 5, "ml");
-    LLVMBasicBlockRef slow_end = LLVMGetInsertBlock(b);
+    LLVMValueRef args[6] = { ctx->regs, ctx->psl, mem, byte_addr,
+                              LLVMConstInt(i32, (unsigned)width, 0),
+                              ctx->fault_slot };
+    LLVMValueRef sv = LLVMBuildCall2(b, fn_ty, hfn, args, 6, "ml");
+
+    LLVMValueRef f = LLVMBuildLoad2(b, i32, ctx->fault_slot, "fst");
+    LLVMValueRef faulted = LLVMBuildICmp(b, LLVMIntNE, f,
+                                          LLVMConstInt(i32, 0, 0), "fl");
+    LLVMBasicBlockRef slow_ok = LLVMAppendBasicBlockInContext(lctx, fn, "mld_ok");
+    LLVMAddIncoming(ctx->fault_pc_phi,
+                    (LLVMValueRef[]){ LLVMConstInt(i32, ctx->cur_pc, 0) },
+                    (LLVMBasicBlockRef[]){ LLVMGetInsertBlock(b) },
+                    1);
+    LLVMBuildCondBr(b, faulted, ctx->fault_exit_bb, slow_ok);
+
+    LLVMPositionBuilderAtEnd(b, slow_ok);
     LLVMBuildBr(b, cont);
 
     LLVMPositionBuilderAtEnd(b, cont);
     LLVMValueRef phi = LLVMBuildPhi(b, i32, "mlv");
     LLVMValueRef in_vals[2] = { fv, sv };
-    LLVMBasicBlockRef in_bbs[2] = { fast_end, slow_end };
+    LLVMBasicBlockRef in_bbs[2] = { fast_end, slow_ok };
     LLVMAddIncoming(phi, in_vals, in_bbs, 2);
     return phi;
 }
 
-/* Emit a memory store with inline fast-path + helper fallback (no phi). */
+/* Emit a memory store with inline fast-path + helper-fallback + fault exit. */
 static void emit_mem_store(LLVMBuilderRef b, LLVMTypeRef i32,
                             LLVMValueRef mem, LLVMValueRef byte_addr,
                             LLVMValueRef val, int width, EmitCtx *ctx)
@@ -684,18 +717,28 @@ static void emit_mem_store(LLVMBuilderRef b, LLVMTypeRef i32,
     LLVMBuildBr(b, cont);
 
     LLVMPositionBuilderAtEnd(b, slow);
+    emit_shadow_spill_for_fault(b, i32, ctx);
     LLVMModuleRef mod    = LLVMGetGlobalParent(fn);
     LLVMTypeRef   ptr    = LLVMPointerTypeInContext(lctx, 0);
-    LLVMTypeRef   parms[6] = { ptr, ptr, ptr, i32, i32, i32 };
+    LLVMTypeRef   parms[7] = { ptr, ptr, ptr, i32, i32, i32, ptr };
     LLVMTypeRef   fn_ty  = LLVMFunctionType(LLVMVoidTypeInContext(lctx),
-                                            parms, 6, 0);
+                                            parms, 7, 0);
     LLVMValueRef  hfn    = LLVMGetNamedFunction(mod, "vax_jit_mem_store_helper");
     if (!hfn)
         hfn = LLVMAddFunction(mod, "vax_jit_mem_store_helper", fn_ty);
-    LLVMValueRef args[6] = { ctx->regs, ctx->psl, mem, byte_addr, val,
-                              LLVMConstInt(i32, (unsigned)width, 0) };
-    LLVMBuildCall2(b, fn_ty, hfn, args, 6, "");
-    LLVMBuildBr(b, cont);
+    LLVMValueRef args[7] = { ctx->regs, ctx->psl, mem, byte_addr, val,
+                              LLVMConstInt(i32, (unsigned)width, 0),
+                              ctx->fault_slot };
+    LLVMBuildCall2(b, fn_ty, hfn, args, 7, "");
+
+    LLVMValueRef f = LLVMBuildLoad2(b, i32, ctx->fault_slot, "fst");
+    LLVMValueRef faulted = LLVMBuildICmp(b, LLVMIntNE, f,
+                                          LLVMConstInt(i32, 0, 0), "fl");
+    LLVMAddIncoming(ctx->fault_pc_phi,
+                    (LLVMValueRef[]){ LLVMConstInt(i32, ctx->cur_pc, 0) },
+                    (LLVMBasicBlockRef[]){ LLVMGetInsertBlock(b) },
+                    1);
+    LLVMBuildCondBr(b, faulted, ctx->fault_exit_bb, cont);
 
     LLVMPositionBuilderAtEnd(b, cont);
 }
@@ -1970,23 +2013,45 @@ static void *compile_block(VaxJITBlock *blk, int start_insn, int end_insn,
     LLVMBasicBlockRef fallthrough_bb =
         LLVMAppendBasicBlockInContext(ctx, fn, "fallthrough");
 
-    /* ---- Populate exit BBs ---- */
-    /* We build exit BB bodies now (they just store PC and ret), but
-       we fill them in after the main emission so the builder is free. */
+    /* Fault-exit BB: shared sink for every mem-op slow-path that signals a
+       translation/access fault. Each contributing slow path AddIncomings its
+       cur_pc constant to fault_pc_phi; the BB stores that PC into regs[15]
+       and returns. The interpreter resumes at that PC and naturally re-faults
+       through the normal SIMH path (setting fault_PC/fault_p1/recq unwind). */
+    LLVMBasicBlockRef fault_exit_bb =
+        LLVMAppendBasicBlockInContext(ctx, fn, "fault_exit");
 
     /* ---- Main emission ---- */
 
-    /* Populate entry_bb: unconditional branch to the first instruction BB. */
+    /* Populate entry_bb: alloca fault_slot, then unconditional branch
+       to the first instruction BB. */
     RegShadow shadow;
     shadow_clear(&shadow);
     EmitCtx emit_ctx = { 0 };
-    emit_ctx.regs = v_regs;
-    emit_ctx.psl  = v_psl;
+    emit_ctx.regs   = v_regs;
+    emit_ctx.psl    = v_psl;
+    emit_ctx.shadow = &shadow;
+    emit_ctx.fault_exit_bb = fault_exit_bb;
     EmitCtx *ectx = &emit_ctx;
     {
         LLVMBasicBlockRef first_bb = (n_bb_map > 0) ? bb_map[0].bb : fallthrough_bb;
         LLVMPositionBuilderAtEnd(b, entry_bb);
-        LLVMBuildBr(b, first_bb);
+        emit_ctx.fault_slot = LLVMBuildAlloca(b, i32, "fault_slot");
+        /* Use a constant-false branch to fault_exit_bb so it always has a
+           predecessor edge (required for a well-formed phi); the optimizer
+           folds this away when no real fault path adds an incoming. */
+        LLVMValueRef false_c = LLVMConstInt(LLVMInt1TypeInContext(ctx), 0, 0);
+        LLVMBuildCondBr(b, false_c, fault_exit_bb, first_bb);
+
+        /* Build the phi up front; seed it from the dummy entry edge so the
+           phi is well-formed even if no mem op contributes. */
+        LLVMPositionBuilderAtEnd(b, fault_exit_bb);
+        emit_ctx.fault_pc_phi = LLVMBuildPhi(b, i32, "fault_pc");
+        LLVMAddIncoming(emit_ctx.fault_pc_phi,
+                        (LLVMValueRef[]){ LLVMConstInt(i32, 0, 0) },
+                        (LLVMBasicBlockRef[]){ entry_bb },
+                        1);
+
         LLVMPositionBuilderAtEnd(b, first_bb);
     }
 
@@ -2195,6 +2260,18 @@ static void *compile_block(VaxJITBlock *blk, int start_insn, int end_insn,
         /* PC already spilled before the back-edge branch; just ret. */
         LLVMBuildRetVoid(b);
     }
+
+    /* ---- Populate fault_exit BB ---- */
+    /* Phi was pre-seeded with a never-taken edge from entry_bb (see entry
+       setup above); each mem-op slow-path AddIncoming'd its cur_pc. Store
+       the resolved fault PC into regs[15] and return to the interpreter. */
+    LLVMPositionBuilderAtEnd(b, fault_exit_bb);
+    {
+        LLVMValueRef idx = LLVMConstInt(i32, 15, 0);
+        LLVMValueRef ptr = LLVMBuildGEP2(b, i32, v_regs, &idx, 1, "");
+        LLVMBuildStore(b, emit_ctx.fault_pc_phi, ptr);
+    }
+    LLVMBuildRetVoid(b);
 
     LLVMDisposeBuilder(b);
 
