@@ -126,6 +126,12 @@ void vax_jit_llvm_register_call_helpers (void *calls_fn, void *ret_fn);
    Must be called after vax_jit_llvm_init(). */
 void vax_jit_llvm_register_misc_helpers (void *extzv_fn, void *insv_fn, void *movc3_fn);
 
+/* Register C helper functions for memory load/store fallback.
+   These are invoked by JIT'd code when the inline fast-path cannot
+   handle an access (page cross, misalign, MMU translation needed).
+   Must be called after vax_jit_llvm_init(). */
+void vax_jit_llvm_register_mem_helpers (void *load_fn, void *store_fn);
+
 /* Execute an already-compiled block function pointer. */
 void vax_jit_llvm_run_block (void *fn, int32_t *regs, int32_t *psl,
                               int32_t *mem, int32_t *sim_interval);

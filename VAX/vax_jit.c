@@ -483,6 +483,53 @@ void vax_jit_movc3_helper_impl(int32_t *regs, int32_t *psl,
     *psl = (*psl & ~0xF) | 0x04;   /* N=0, Z=1, V=0, C=0 */
 }
 
+/* ------------------------------------------------------------------ */
+/* Memory load/store fallback helpers                                  */
+/*                                                                     */
+/* Today these mirror the inline IR emitted by emit_mem_{load,store}:  */
+/* a direct host-memory access into M[], no MMU translation. This      */
+/* validates the helper-call plumbing for the upcoming inline-check    */
+/* fast-path work. A follow-up will swap the body for a translate-and- */
+/* check-then-access path that returns success/failure to the JIT, so  */
+/* the JIT can exit cleanly at the faulting PC on a miss.              */
+/* ------------------------------------------------------------------ */
+
+int32_t vax_jit_mem_load_helper_impl(int32_t *regs, int32_t *psl,
+                                      int32_t *mem,
+                                      int32_t va, int32_t width)
+{
+    (void)regs; (void)psl;
+    uint32_t addr = (uint32_t)va;
+    uint8_t  *mb  = (uint8_t *)mem;
+    if (width == 1)
+        return (int32_t)mb[addr];
+    if (width == 2) {
+        uint16_t w;
+        memcpy(&w, mb + addr, 2);
+        return (int32_t)w;
+    }
+    return mem[addr >> 2];
+}
+
+void vax_jit_mem_store_helper_impl(int32_t *regs, int32_t *psl,
+                                    int32_t *mem,
+                                    int32_t va, int32_t val, int32_t width)
+{
+    (void)regs; (void)psl;
+    uint32_t addr = (uint32_t)va;
+    uint8_t  *mb  = (uint8_t *)mem;
+    if (width == 1) {
+        mb[addr] = (uint8_t)val;
+        return;
+    }
+    if (width == 2) {
+        uint16_t w = (uint16_t)val;
+        memcpy(mb + addr, &w, 2);
+        return;
+    }
+    mem[addr >> 2] = val;
+}
+
 int vax_jit_init(void)
 {
     vax_jit_llvm_set_ir_dump(vax_jit_ir_dump);
@@ -495,6 +542,9 @@ int vax_jit_init(void)
         (void *)vax_jit_extzv_helper_impl,
         (void *)vax_jit_insv_helper_impl,
         (void *)vax_jit_movc3_helper_impl);
+    vax_jit_llvm_register_mem_helpers(
+        (void *)vax_jit_mem_load_helper_impl,
+        (void *)vax_jit_mem_store_helper_impl);
     return 0;
 }
 void vax_jit_destroy(void) { vax_jit_llvm_destroy(); }

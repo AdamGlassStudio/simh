@@ -86,7 +86,9 @@ static NopFn   fn_nop;
    helper bodies still use their existing positional parameters so this
    refactor is intentionally behavior-preserving. */
 typedef struct {
-    uint32_t cur_pc;   /* PC of instruction currently being emitted */
+    uint32_t      cur_pc;   /* PC of instruction currently being emitted */
+    LLVMValueRef  regs;     /* i32* register file param */
+    LLVMValueRef  psl;      /* i32* PSL param */
 } EmitCtx;
 
 /* ------------------------------------------------------------------ */
@@ -536,50 +538,42 @@ static void shadow_spill(LLVMBuilderRef b, LLVMTypeRef i32,
 /* Memory access helpers (VAX byte address -> M[addr>>2])              */
 /* ------------------------------------------------------------------ */
 
+/* Emit a call to vax_jit_mem_load_helper(regs, psl, mem, va, width).
+   Helper returns a zero-extended 32-bit value (byte/word are zero-extended). */
 static LLVMValueRef emit_mem_load(LLVMBuilderRef b, LLVMTypeRef i32,
                                    LLVMValueRef mem, LLVMValueRef byte_addr,
                                    int width, EmitCtx *ctx)
 {
-    (void)ctx;
-    LLVMContextRef lctx = LLVMGetTypeContext(i32);
-    LLVMTypeRef i8  = LLVMInt8TypeInContext(lctx);
-    LLVMTypeRef i16 = LLVMInt16TypeInContext(lctx);
-    if (width == 1) {
-        LLVMValueRef ptr = LLVMBuildGEP2(b, i8, mem, &byte_addr, 1, "bp");
-        LLVMValueRef val = LLVMBuildLoad2(b, i8, ptr, "bv");
-        return LLVMBuildZExt(b, val, i32, "ze");
-    } else if (width == 2) {
-        LLVMValueRef ptr = LLVMBuildGEP2(b, i8, mem, &byte_addr, 1, "wp");
-        LLVMValueRef val = LLVMBuildLoad2(b, i16, ptr, "wv");
-        return LLVMBuildZExt(b, val, i32, "ze");
-    } else {
-        LLVMValueRef idx = LLVMBuildLShr(b, byte_addr, LLVMConstInt(i32, 2, 0), "wi");
-        LLVMValueRef ptr = LLVMBuildGEP2(b, i32, mem, &idx, 1, "mp");
-        return LLVMBuildLoad2(b, i32, ptr, "mv");
-    }
+    LLVMModuleRef mod = LLVMGetGlobalParent(LLVMGetBasicBlockParent(
+                            LLVMGetInsertBlock(b)));
+    LLVMTypeRef   ptr = LLVMPointerTypeInContext(LLVMGetTypeContext(i32), 0);
+    LLVMTypeRef   parms[5] = { ptr, ptr, ptr, i32, i32 };
+    LLVMTypeRef   fn_ty = LLVMFunctionType(i32, parms, 5, 0);
+    LLVMValueRef  fn = LLVMGetNamedFunction(mod, "vax_jit_mem_load_helper");
+    if (!fn)
+        fn = LLVMAddFunction(mod, "vax_jit_mem_load_helper", fn_ty);
+    LLVMValueRef args[5] = { ctx->regs, ctx->psl, mem, byte_addr,
+                              LLVMConstInt(i32, (unsigned)width, 0) };
+    return LLVMBuildCall2(b, fn_ty, fn, args, 5, "ml");
 }
 
+/* Emit a call to vax_jit_mem_store_helper(regs, psl, mem, va, val, width). */
 static void emit_mem_store(LLVMBuilderRef b, LLVMTypeRef i32,
                             LLVMValueRef mem, LLVMValueRef byte_addr,
                             LLVMValueRef val, int width, EmitCtx *ctx)
 {
-    (void)ctx;
-    LLVMContextRef lctx = LLVMGetTypeContext(i32);
-    LLVMTypeRef i8  = LLVMInt8TypeInContext(lctx);
-    LLVMTypeRef i16 = LLVMInt16TypeInContext(lctx);
-    if (width == 1) {
-        LLVMValueRef ptr = LLVMBuildGEP2(b, i8, mem, &byte_addr, 1, "bp");
-        LLVMValueRef trv = LLVMBuildTrunc(b, val, i8, "bt");
-        LLVMBuildStore(b, trv, ptr);
-    } else if (width == 2) {
-        LLVMValueRef ptr = LLVMBuildGEP2(b, i8, mem, &byte_addr, 1, "wp");
-        LLVMValueRef trv = LLVMBuildTrunc(b, val, i16, "wt");
-        LLVMBuildStore(b, trv, ptr);
-    } else {
-        LLVMValueRef idx = LLVMBuildLShr(b, byte_addr, LLVMConstInt(i32, 2, 0), "wi");
-        LLVMValueRef ptr = LLVMBuildGEP2(b, i32, mem, &idx, 1, "mp");
-        LLVMBuildStore(b, val, ptr);
-    }
+    LLVMModuleRef mod = LLVMGetGlobalParent(LLVMGetBasicBlockParent(
+                            LLVMGetInsertBlock(b)));
+    LLVMTypeRef   ptr = LLVMPointerTypeInContext(LLVMGetTypeContext(i32), 0);
+    LLVMTypeRef   parms[6] = { ptr, ptr, ptr, i32, i32, i32 };
+    LLVMTypeRef   fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(
+                              LLVMGetTypeContext(i32)), parms, 6, 0);
+    LLVMValueRef  fn = LLVMGetNamedFunction(mod, "vax_jit_mem_store_helper");
+    if (!fn)
+        fn = LLVMAddFunction(mod, "vax_jit_mem_store_helper", fn_ty);
+    LLVMValueRef args[6] = { ctx->regs, ctx->psl, mem, byte_addr, val,
+                              LLVMConstInt(i32, (unsigned)width, 0) };
+    LLVMBuildCall2(b, fn_ty, fn, args, 6, "");
 }
 
 /* Compute effective byte address for a memory operand.
@@ -1862,6 +1856,8 @@ static void *compile_block(VaxJITBlock *blk, int start_insn, int end_insn,
     RegShadow shadow;
     shadow_clear(&shadow);
     EmitCtx emit_ctx = { 0 };
+    emit_ctx.regs = v_regs;
+    emit_ctx.psl  = v_psl;
     EmitCtx *ectx = &emit_ctx;
     {
         LLVMBasicBlockRef first_bb = (n_bb_map > 0) ? bb_map[0].bb : fallthrough_bb;
@@ -2287,6 +2283,34 @@ void vax_jit_llvm_register_misc_helpers(void *extzv_fn, void *insv_fn, void *mov
     if (err) {
         char *msg = LLVMGetErrorMessage(err);
         fprintf(stderr, "vax_jit: failed to register misc helpers: %s\n", msg);
+        LLVMDisposeErrorMessage(msg);
+    }
+}
+
+void vax_jit_llvm_register_mem_helpers(void *load_fn, void *store_fn)
+{
+    LLVMOrcExecutionSessionRef es       = LLVMOrcLLJITGetExecutionSession(jit);
+    LLVMOrcJITDylibRef         main_lib = LLVMOrcLLJITGetMainJITDylib(jit);
+
+    LLVMJITSymbolFlags flags;
+    flags.GenericFlags = (uint8_t)(LLVMJITSymbolGenericFlagsExported |
+                                   LLVMJITSymbolGenericFlagsCallable);
+    flags.TargetFlags  = 0;
+
+    LLVMOrcCSymbolMapPair syms[2];
+    syms[0].Name = LLVMOrcExecutionSessionIntern(es, "vax_jit_mem_load_helper");
+    syms[0].Sym.Address = (LLVMOrcExecutorAddress)(uintptr_t)load_fn;
+    syms[0].Sym.Flags   = flags;
+
+    syms[1].Name = LLVMOrcExecutionSessionIntern(es, "vax_jit_mem_store_helper");
+    syms[1].Sym.Address = (LLVMOrcExecutorAddress)(uintptr_t)store_fn;
+    syms[1].Sym.Flags   = flags;
+
+    LLVMOrcMaterializationUnitRef mu = LLVMOrcAbsoluteSymbols(syms, 2);
+    LLVMErrorRef err = LLVMOrcJITDylibDefine(main_lib, mu);
+    if (err) {
+        char *msg = LLVMGetErrorMessage(err);
+        fprintf(stderr, "vax_jit: failed to register mem helpers: %s\n", msg);
         LLVMDisposeErrorMessage(msg);
     }
 }
