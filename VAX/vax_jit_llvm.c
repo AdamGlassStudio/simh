@@ -99,6 +99,13 @@ typedef struct {
     LLVMBasicBlockRef fault_exit_bb;/* shared per-block: phi cur_pc, store to R15, ret */
     LLVMValueRef      fault_pc_phi; /* phi i32 in fault_exit_bb */
     RegShadow        *shadow;       /* current shadow state (for spilling on slow path) */
+    /* Per-instruction snapshot of register values prior to any autoinc/autodec
+       side effects in the current insn. Used to roll regs[] back to pre-insn
+       state on the fault path so the interpreter can re-execute cleanly.
+       Reset to empty by the caller before each emit_insn invocation. */
+    int               snap_n;
+    int               snap_reg[8];
+    LLVMValueRef      snap_orig[8];
 } EmitCtx;
 
 /* ------------------------------------------------------------------ */
@@ -616,12 +623,66 @@ static LLVMValueRef emit_mmu_on_check(LLVMBuilderRef b, LLVMTypeRef i32)
    Called before the slow-path helper invocation so that, on a fault
    exit, the register file in memory reflects the JIT's working state.
    (Note: any autoincrement side-effects already committed to shadow
-   for this instruction are NOT unwound — see vax_jit.c helper notes.) */
+   for this instruction are restored to their pre-insn values on the
+   fault path — see snap_record / emit_fault_branch.) */
 static void emit_shadow_spill_for_fault(LLVMBuilderRef b, LLVMTypeRef i32,
                                          EmitCtx *ctx)
 {
     if (ctx->shadow)
         shadow_spill(b, i32, ctx->shadow, ctx->regs);
+}
+
+/* Record original value of `reg` before an autoinc/autodec mutates the
+   shadow. Idempotent per reg per instruction — only the FIRST original
+   value (the true pre-insn value) is kept; subsequent calls are no-ops.
+   Bounded to 8 slots; the worst legal VAX insn touches few regs.       */
+static void snap_record(EmitCtx *ctx, int reg, LLVMValueRef orig)
+{
+    int i;
+    for (i = 0; i < ctx->snap_n; i++)
+        if (ctx->snap_reg[i] == reg)
+            return;
+    if (ctx->snap_n >= 8)
+        return;
+    ctx->snap_reg[ctx->snap_n] = reg;
+    ctx->snap_orig[ctx->snap_n] = orig;
+    ctx->snap_n++;
+}
+
+/* Emit the fault-branch tail for a slow-path mem helper call:
+     br %faulted, %restore, %ok
+   restore:
+     <store snap_orig[i] to regs[snap_reg[i]] for each snapshot>
+     br %fault_exit_bb     (adds incoming cur_pc -> restore)
+   Leaves builder positioned at %ok. */
+static LLVMBasicBlockRef emit_fault_branch(LLVMBuilderRef b, LLVMTypeRef i32,
+                                            EmitCtx *ctx, LLVMValueRef faulted)
+{
+    LLVMContextRef    lctx    = LLVMGetTypeContext(i32);
+    LLVMValueRef      fn      = LLVMGetBasicBlockParent(LLVMGetInsertBlock(b));
+    LLVMBasicBlockRef restore = LLVMAppendBasicBlockInContext(lctx, fn, "mfrst");
+    LLVMBasicBlockRef ok      = LLVMAppendBasicBlockInContext(lctx, fn, "mfok");
+
+    LLVMBuildCondBr(b, faulted, restore, ok);
+
+    LLVMPositionBuilderAtEnd(b, restore);
+    {
+        int i;
+        for (i = 0; i < ctx->snap_n; i++) {
+            LLVMValueRef gep_idx = LLVMConstInt(i32, ctx->snap_reg[i], 0);
+            LLVMValueRef slot    = LLVMBuildGEP2(b, i32, ctx->regs,
+                                                 &gep_idx, 1, "rsl");
+            LLVMBuildStore(b, ctx->snap_orig[i], slot);
+        }
+    }
+    LLVMAddIncoming(ctx->fault_pc_phi,
+                    (LLVMValueRef[]){ LLVMConstInt(i32, ctx->cur_pc, 0) },
+                    (LLVMBasicBlockRef[]){ restore },
+                    1);
+    LLVMBuildBr(b, ctx->fault_exit_bb);
+
+    LLVMPositionBuilderAtEnd(b, ok);
+    return ok;
 }
 
 /* Emit a memory load with inline fast-path + helper-fallback + fault exit.
@@ -676,14 +737,7 @@ static LLVMValueRef emit_mem_load(LLVMBuilderRef b, LLVMTypeRef i32,
     LLVMValueRef f = LLVMBuildLoad2(b, i32, ctx->fault_slot, "fst");
     LLVMValueRef faulted = LLVMBuildICmp(b, LLVMIntNE, f,
                                           LLVMConstInt(i32, 0, 0), "fl");
-    LLVMBasicBlockRef slow_ok = LLVMAppendBasicBlockInContext(lctx, fn, "mld_ok");
-    LLVMAddIncoming(ctx->fault_pc_phi,
-                    (LLVMValueRef[]){ LLVMConstInt(i32, ctx->cur_pc, 0) },
-                    (LLVMBasicBlockRef[]){ LLVMGetInsertBlock(b) },
-                    1);
-    LLVMBuildCondBr(b, faulted, ctx->fault_exit_bb, slow_ok);
-
-    LLVMPositionBuilderAtEnd(b, slow_ok);
+    LLVMBasicBlockRef slow_ok = emit_fault_branch(b, i32, ctx, faulted);
     LLVMBuildBr(b, cont);
 
     LLVMPositionBuilderAtEnd(b, cont);
@@ -734,11 +788,8 @@ static void emit_mem_store(LLVMBuilderRef b, LLVMTypeRef i32,
     LLVMValueRef f = LLVMBuildLoad2(b, i32, ctx->fault_slot, "fst");
     LLVMValueRef faulted = LLVMBuildICmp(b, LLVMIntNE, f,
                                           LLVMConstInt(i32, 0, 0), "fl");
-    LLVMAddIncoming(ctx->fault_pc_phi,
-                    (LLVMValueRef[]){ LLVMConstInt(i32, ctx->cur_pc, 0) },
-                    (LLVMBasicBlockRef[]){ LLVMGetInsertBlock(b) },
-                    1);
-    LLVMBuildCondBr(b, faulted, ctx->fault_exit_bb, cont);
+    (void)emit_fault_branch(b, i32, ctx, faulted);
+    LLVMBuildBr(b, cont);
 
     LLVMPositionBuilderAtEnd(b, cont);
 }
@@ -757,16 +808,19 @@ static LLVMValueRef emit_operand_ea(LLVMBuilderRef b, LLVMTypeRef i32,
         return shadow_get(b, i32, s, op->reg, regs);
     case JITBLK_AUTODECREMENT:
         base = shadow_get(b, i32, s, op->reg, regs);
+        snap_record(ctx, op->reg, base);
         ea   = LLVMBuildSub(b, base, LLVMConstInt(i32, op->width, 0), "ad");
         shadow_set(s, op->reg, ea);
         return ea;
     case JITBLK_AUTOINCREMENT:
         base = shadow_get(b, i32, s, op->reg, regs);
+        snap_record(ctx, op->reg, base);
         shadow_set(s, op->reg,
                    LLVMBuildAdd(b, base, LLVMConstInt(i32, op->width, 0), "ai"));
         return base;
     case JITBLK_AUTOINC_DEF:
         base = shadow_get(b, i32, s, op->reg, regs);
+        snap_record(ctx, op->reg, base);
         shadow_set(s, op->reg,
                    LLVMBuildAdd(b, base, LLVMConstInt(i32, 4, 0), "ai"));
         return emit_mem_load(b, i32, mem, base, 4, ctx);
@@ -2229,6 +2283,7 @@ static void *compile_block(VaxJITBlock *blk, int start_insn, int end_insn,
             }
         } else {
             /* Normal non-branch instruction */
+            ectx->snap_n = 0;
             emit_insn(b, i32, insn, &shadow, v_regs, v_psl, v_mem, ectx);
             builder_terminated = 0;
         }
