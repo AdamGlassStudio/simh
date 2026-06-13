@@ -149,6 +149,14 @@ void vax_jit_llvm_register_mem_helpers (void *load_fn, void *store_fn);
    Must be called after vax_jit_llvm_init(). */
 void vax_jit_llvm_register_mmu_state (int32_t *mapen_ptr);
 
+/* Register the system / process TLB array base addresses so the JIT can
+   emit inline TLB lookups in the slow path before falling to the C helper.
+   stlb_p points to TLBENT stlb[VA_TBSIZE], ptlb_p to TLBENT ptlb[VA_TBSIZE].
+   Each TLBENT is { int32 tag; int32 pte; }. May be called once at init.
+   If never called, the JIT skips the inline TLB path and always calls the
+   C helper for MMU-on accesses. */
+void vax_jit_llvm_register_tlb (void *stlb_p, void *ptlb_p);
+
 /* Execute an already-compiled block function pointer. */
 void vax_jit_llvm_run_block (void *fn, int32_t *regs, int32_t *psl,
                               int32_t *mem, int32_t *sim_interval);

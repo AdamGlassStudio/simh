@@ -13,6 +13,20 @@
 #include "vax_mmu.h"
 #include <stdint.h>
 #include <string.h>
+#include <assert.h>
+
+/* Constants the JIT bakes into emitted IR (in vax_jit_llvm.c). Verify
+   they still match the canonical SIMH definitions; if PAWIDTH or TLBENT
+   layout changes, the assertions catch the drift. */
+_Static_assert(VA_N_OFF == 9, "JIT_VA_N_OFF mismatch");
+_Static_assert(VA_M_OFF == 0x1FF, "JIT_VA_M_OFF mismatch");
+_Static_assert(VA_M_TBI == 0xFFF, "JIT_VA_M_TBI mismatch");
+_Static_assert(VA_S0    == 0x80000000u, "JIT_VA_S0 mismatch");
+_Static_assert(TLB_PFN  == 0x3FFFFE00u, "JIT_TLB_PFN mismatch (PAWIDTH != 30?)");
+_Static_assert(TLB_M    == 0x100u, "JIT_TLB_M mismatch");
+_Static_assert(IOPAGE   == 0x20000000, "JIT_IOPAGE mismatch");
+_Static_assert(PSL_V_CUR == 24, "JIT_PSL_V_CUR mismatch");
+_Static_assert(sizeof(TLBENT) == 8, "JIT_TLB_ENTRY_SZ mismatch");
 
 /* vax_defs.h defines R and PSL as compat macros pointing to cpu_state.
    Undefine them here so we can access struct members via a pointer
@@ -611,6 +625,7 @@ int vax_jit_init(void)
         (void *)vax_jit_mem_load_helper_impl,
         (void *)vax_jit_mem_store_helper_impl);
     vax_jit_llvm_register_mmu_state(&mapen);
+    vax_jit_llvm_register_tlb(stlb, ptlb);
     return 0;
 }
 void vax_jit_destroy(void) { vax_jit_llvm_destroy(); }

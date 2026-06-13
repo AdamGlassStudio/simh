@@ -80,6 +80,12 @@ static NopFn   fn_nop;
    value at runtime to branch between inline fast-path and helper call. */
 static int32_t *mapen_ptr = NULL;
 
+/* Addresses of the system / process TLB arrays (see vax_jit_llvm_register_tlb).
+   When non-NULL, the slow path emits an inline TLB lookup before falling
+   through to the C helper. Each TLB entry is { int32 tag; int32 pte; }. */
+static void *stlb_ptr = NULL;
+static void *ptlb_ptr = NULL;
+
 /* ------------------------------------------------------------------ */
 /* Emitter context                                                     */
 /* ------------------------------------------------------------------ */
@@ -685,6 +691,123 @@ static LLVMBasicBlockRef emit_fault_branch(LLVMBuilderRef b, LLVMTypeRef i32,
     return ok;
 }
 
+/* MMU constants mirrored from vax_defs.h. Kept local since this file is
+   LLVM-only and does not include SIMH headers. Static asserts in the C
+   helper code (vax_jit.c) verify these match the canonical definitions. */
+#define JIT_VA_N_OFF      9
+#define JIT_VA_M_OFF      0x1FFu          /* page offset mask */
+#define JIT_VA_M_TBI      0xFFFu          /* TLB index mask (12 bits) */
+#define JIT_VA_S0         0x80000000u     /* system-space VA bit */
+#define JIT_TLB_PFN       0x3FFFFE00u     /* PFN bits in pte (PAWIDTH=30) */
+#define JIT_TLB_M         0x100u          /* M-bit in pte */
+#define JIT_IOPAGE        0x20000000u     /* start of I/O page (PA) */
+#define JIT_PSL_V_CUR     24
+#define JIT_TLB_ENTRY_SZ  8               /* sizeof(TLBENT) = 2 * i32 */
+
+/* Result of an inline TLB lookup. The caller positions the builder at
+   `hit_bb` to emit the inline mem access (using `paddr`), then branches
+   to its merge BB; or positions at `miss_bb` to emit the C-helper fall-
+   back. Returns paddr=NULL when stlb/ptlb were never registered, in
+   which case the caller must skip the inline TLB path entirely. */
+typedef struct {
+    LLVMBasicBlockRef hit_bb;
+    LLVMBasicBlockRef miss_bb;
+    LLVMValueRef      paddr;
+} TlbLookup;
+
+/* Emit IR for an inline TLB lookup.
+   Splits control flow to either `hit_bb` (TLB tag matches, access bits
+   permit, no cross-page, no IO page, and for writes M-bit is set) or
+   `miss_bb` (any of those checks failed — caller should call helper).
+   Builder is left at the END of the lookup IR (i.e. having issued the
+   condbr); caller positions to one of the returned BBs to emit. */
+static TlbLookup emit_tlb_lookup(LLVMBuilderRef b, LLVMTypeRef i32,
+                                  LLVMValueRef byte_addr, int width,
+                                  int is_write, EmitCtx *ctx)
+{
+    TlbLookup out = { NULL, NULL, NULL };
+    if (!stlb_ptr || !ptlb_ptr)
+        return out;
+
+    LLVMContextRef lctx = LLVMGetTypeContext(i32);
+    LLVMTypeRef    i64  = LLVMInt64TypeInContext(lctx);
+    LLVMTypeRef    ptr  = LLVMPointerTypeInContext(lctx, 0);
+    LLVMValueRef   fn   = LLVMGetBasicBlockParent(LLVMGetInsertBlock(b));
+
+    out.hit_bb  = LLVMAppendBasicBlockInContext(lctx, fn, "tlb_hit");
+    out.miss_bb = LLVMAppendBasicBlockInContext(lctx, fn, "tlb_miss");
+
+    LLVMValueRef vpn    = LLVMBuildLShr(b, byte_addr,
+                                LLVMConstInt(i32, JIT_VA_N_OFF, 0), "vpn");
+    LLVMValueRef tbi    = LLVMBuildAnd(b, vpn,
+                                LLVMConstInt(i32, JIT_VA_M_TBI, 0), "tbi");
+    LLVMValueRef is_s0_v = LLVMBuildAnd(b, byte_addr,
+                                LLVMConstInt(i32, JIT_VA_S0, 0), "iss0v");
+    LLVMValueRef is_s0   = LLVMBuildICmp(b, LLVMIntNE, is_s0_v,
+                                LLVMConstInt(i32, 0, 0), "iss0");
+
+    LLVMValueRef sbase = LLVMConstIntToPtr(
+                          LLVMConstInt(i64, (uint64_t)(uintptr_t)stlb_ptr, 0), ptr);
+    LLVMValueRef pbase = LLVMConstIntToPtr(
+                          LLVMConstInt(i64, (uint64_t)(uintptr_t)ptlb_ptr, 0), ptr);
+    LLVMValueRef base  = LLVMBuildSelect(b, is_s0, sbase, pbase, "tbas");
+
+    LLVMValueRef byte_off = LLVMBuildMul(b, tbi,
+                                LLVMConstInt(i32, JIT_TLB_ENTRY_SZ, 0), "tof");
+    LLVMTypeRef i8 = LLVMInt8TypeInContext(lctx);
+    LLVMValueRef entry_p = LLVMBuildGEP2(b, i8, base, &byte_off, 1, "entp");
+    LLVMValueRef tag = LLVMBuildLoad2(b, i32, entry_p, "ttag");
+    LLVMValueRef pte_off_idx = LLVMConstInt(i32, 4, 0);
+    LLVMValueRef pte_p = LLVMBuildGEP2(b, i8, entry_p, &pte_off_idx, 1, "ptep");
+    LLVMValueRef pte = LLVMBuildLoad2(b, i32, pte_p, "tpte");
+
+    /* acc_mask = 1 << (cur + (is_write ? 4 : 0)) */
+    LLVMValueRef psl_v = LLVMBuildLoad2(b, i32, ctx->psl, "pslv");
+    LLVMValueRef cur   = LLVMBuildAnd(b,
+                            LLVMBuildLShr(b, psl_v,
+                                LLVMConstInt(i32, JIT_PSL_V_CUR, 0), "psh"),
+                            LLVMConstInt(i32, 3, 0), "cur");
+    LLVMValueRef shift = is_write
+        ? LLVMBuildAdd(b, cur, LLVMConstInt(i32, 4, 0), "wsh")
+        : cur;
+    LLVMValueRef acc_mask = LLVMBuildShl(b, LLVMConstInt(i32, 1, 0),
+                                          shift, "amask");
+
+    LLVMValueRef c_tag = LLVMBuildICmp(b, LLVMIntEQ, tag, vpn, "ctag");
+    LLVMValueRef c_acc = LLVMBuildICmp(b, LLVMIntNE,
+                            LLVMBuildAnd(b, pte, acc_mask, "amx"),
+                            LLVMConstInt(i32, 0, 0), "cacc");
+    LLVMValueRef c_io  = LLVMBuildICmp(b, LLVMIntEQ,
+                            LLVMBuildAnd(b, pte,
+                                LLVMConstInt(i32, JIT_IOPAGE, 0), "iom"),
+                            LLVMConstInt(i32, 0, 0), "cio");
+    LLVMValueRef va_off = LLVMBuildAnd(b, byte_addr,
+                                LLVMConstInt(i32, JIT_VA_M_OFF, 0), "voff");
+    LLVMValueRef c_xp  = LLVMBuildICmp(b, LLVMIntULE, va_off,
+                            LLVMConstInt(i32, JIT_VA_M_OFF + 1 - (uint32_t)width, 0),
+                            "cxp");
+
+    LLVMValueRef hit = LLVMBuildAnd(b, c_tag, c_acc, "h1");
+    hit = LLVMBuildAnd(b, hit, c_io, "h2");
+    hit = LLVMBuildAnd(b, hit, c_xp, "h3");
+    if (is_write) {
+        LLVMValueRef c_m = LLVMBuildICmp(b, LLVMIntNE,
+                              LLVMBuildAnd(b, pte,
+                                  LLVMConstInt(i32, JIT_TLB_M, 0), "mbx"),
+                              LLVMConstInt(i32, 0, 0), "cm");
+        hit = LLVMBuildAnd(b, hit, c_m, "h4");
+    }
+
+    LLVMBuildCondBr(b, hit, out.hit_bb, out.miss_bb);
+
+    /* Compute paddr in hit_bb so the caller can use it directly. */
+    LLVMPositionBuilderAtEnd(b, out.hit_bb);
+    LLVMValueRef pfn = LLVMBuildAnd(b, pte,
+                                LLVMConstInt(i32, JIT_TLB_PFN, 0), "pfn");
+    out.paddr = LLVMBuildOr(b, pfn, va_off, "pa");
+    return out;
+}
+
 /* Emit a memory load with inline fast-path + helper-fallback + fault exit.
    IR shape:
      %mmu_on = load *mapen != 0
@@ -720,7 +843,21 @@ static LLVMValueRef emit_mem_load(LLVMBuilderRef b, LLVMTypeRef i32,
     LLVMBasicBlockRef fast_end = LLVMGetInsertBlock(b);
     LLVMBuildBr(b, cont);
 
+    /* Slow path: try inline TLB lookup first; on miss, fall to helper. */
     LLVMPositionBuilderAtEnd(b, slow);
+    TlbLookup tl = emit_tlb_lookup(b, i32, byte_addr, width, 0, ctx);
+
+    LLVMValueRef     hv = NULL;
+    LLVMBasicBlockRef hit_end = NULL;
+    if (tl.paddr) {
+        /* TLB-hit: inline mem access at the resolved physical address. */
+        hv = emit_mem_load_inline(b, i32, mem, tl.paddr, width);
+        hit_end = LLVMGetInsertBlock(b);
+        LLVMBuildBr(b, cont);
+        LLVMPositionBuilderAtEnd(b, tl.miss_bb);
+    }
+
+    /* Helper-call (TLB miss, or no TLB pointers registered). */
     emit_shadow_spill_for_fault(b, i32, ctx);
     LLVMModuleRef mod    = LLVMGetGlobalParent(fn);
     LLVMTypeRef   ptr    = LLVMPointerTypeInContext(lctx, 0);
@@ -742,13 +879,20 @@ static LLVMValueRef emit_mem_load(LLVMBuilderRef b, LLVMTypeRef i32,
 
     LLVMPositionBuilderAtEnd(b, cont);
     LLVMValueRef phi = LLVMBuildPhi(b, i32, "mlv");
-    LLVMValueRef in_vals[2] = { fv, sv };
-    LLVMBasicBlockRef in_bbs[2] = { fast_end, slow_ok };
-    LLVMAddIncoming(phi, in_vals, in_bbs, 2);
+    if (tl.paddr) {
+        LLVMValueRef in_vals[3] = { fv, hv, sv };
+        LLVMBasicBlockRef in_bbs[3] = { fast_end, hit_end, slow_ok };
+        LLVMAddIncoming(phi, in_vals, in_bbs, 3);
+    } else {
+        LLVMValueRef in_vals[2] = { fv, sv };
+        LLVMBasicBlockRef in_bbs[2] = { fast_end, slow_ok };
+        LLVMAddIncoming(phi, in_vals, in_bbs, 2);
+    }
     return phi;
 }
 
-/* Emit a memory store with inline fast-path + helper-fallback + fault exit. */
+/* Emit a memory store with inline fast-path + TLB fast-path + helper-fallback
+   + fault exit. */
 static void emit_mem_store(LLVMBuilderRef b, LLVMTypeRef i32,
                             LLVMValueRef mem, LLVMValueRef byte_addr,
                             LLVMValueRef val, int width, EmitCtx *ctx)
@@ -771,6 +915,14 @@ static void emit_mem_store(LLVMBuilderRef b, LLVMTypeRef i32,
     LLVMBuildBr(b, cont);
 
     LLVMPositionBuilderAtEnd(b, slow);
+    TlbLookup tl = emit_tlb_lookup(b, i32, byte_addr, width, 1, ctx);
+
+    if (tl.paddr) {
+        emit_mem_store_inline(b, i32, mem, tl.paddr, val, width);
+        LLVMBuildBr(b, cont);
+        LLVMPositionBuilderAtEnd(b, tl.miss_bb);
+    }
+
     emit_shadow_spill_for_fault(b, i32, ctx);
     LLVMModuleRef mod    = LLVMGetGlobalParent(fn);
     LLVMTypeRef   ptr    = LLVMPointerTypeInContext(lctx, 0);
@@ -2574,6 +2726,12 @@ void vax_jit_llvm_register_mem_helpers(void *load_fn, void *store_fn)
 void vax_jit_llvm_register_mmu_state(int32_t *p)
 {
     mapen_ptr = p;
+}
+
+void vax_jit_llvm_register_tlb(void *stlb_p, void *ptlb_p)
+{
+    stlb_ptr = stlb_p;
+    ptlb_ptr = ptlb_p;
 }
 
 /* ------------------------------------------------------------------ */
