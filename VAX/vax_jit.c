@@ -80,29 +80,37 @@ int vax_jit_ir_dump = 0;
 
 typedef struct {
     uint32_t pc;      /* guest PC key; 0 = empty */
+    uint32_t epoch;   /* JIT cache epoch at insertion time; 0 = empty */
     uint32_t n_insns; /* instruction count for sim_interval accounting */
     void    *fn;      /* compiled host function pointer */
 } VaxJITCacheEntry;
 
 static VaxJITCacheEntry jit_cache[VAX_JIT_CACHE_SIZE];
 
+/* Monotonic epoch counter. Cache entries are valid only when their
+   stored epoch matches this. Starts at 1 so the all-zero entry state
+   (epoch=0) is reliably "empty". On wrap back to 0 we full-flush. */
+static uint32_t jit_epoch = 1;
+
 void *vax_jit_cache_lookup(uint32_t pc)
 {
     uint32_t idx = (pc ^ (pc >> VAX_JIT_CACHE_BITS)) & VAX_JIT_CACHE_MASK;
     VaxJITCacheEntry *e = &jit_cache[idx];
-    return (e->pc == pc && e->fn) ? e->fn : NULL;
+    return (e->pc == pc && e->epoch == jit_epoch && e->fn) ? e->fn : NULL;
 }
 
 uint32_t vax_jit_cache_n_insns(uint32_t pc)
 {
     uint32_t idx = (pc ^ (pc >> VAX_JIT_CACHE_BITS)) & VAX_JIT_CACHE_MASK;
-    return jit_cache[idx].n_insns;
+    VaxJITCacheEntry *e = &jit_cache[idx];
+    return (e->epoch == jit_epoch) ? e->n_insns : 0;
 }
 
 void vax_jit_cache_insert_n(uint32_t pc, void *fn, uint32_t n_insns)
 {
     uint32_t idx = (pc ^ (pc >> VAX_JIT_CACHE_BITS)) & VAX_JIT_CACHE_MASK;
     jit_cache[idx].pc      = pc;
+    jit_cache[idx].epoch   = jit_epoch;
     jit_cache[idx].fn      = fn;
     jit_cache[idx].n_insns = n_insns;
 }
@@ -110,6 +118,15 @@ void vax_jit_cache_insert_n(uint32_t pc, void *fn, uint32_t n_insns)
 void vax_jit_cache_flush(void)
 {
     memset(jit_cache, 0, sizeof jit_cache);
+    jit_epoch = 1;
+}
+
+void vax_jit_epoch_bump(void)
+{
+    if (++jit_epoch == 0) {           /* wrapped — stale entries could re-match */
+        memset(jit_cache, 0, sizeof jit_cache);
+        jit_epoch = 1;
+    }
 }
 
 /* ------------------------------------------------------------------ */

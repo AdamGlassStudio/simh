@@ -194,6 +194,14 @@ void vax_jit_destroy (void);
 /* Flush all block cache entries (call on LDPCTX, MAPEN toggle, etc.)    */
 void vax_jit_cache_flush (void);
 
+/* Bump the JIT cache epoch — lazy invalidation of all cached blocks.
+   Call when any guest event may invalidate previously translated code:
+   LDPCTX (process switch), MAPEN toggle, TBIA/TBIS, or MTPR to P0BR/P0LR/
+   P1BR/P1LR/SBR/SLR. Cheaper than a full memset; cached entries simply
+   stop matching on lookup. Wraparound is handled internally (full flush
+   on overflow back to the empty sentinel). */
+void vax_jit_epoch_bump (void);
+
 /* Look up and insert into the block cache (used by vax_cpu.c).          */
 void    *vax_jit_cache_lookup   (uint32_t pc);
 uint32_t vax_jit_cache_n_insns  (uint32_t pc);

@@ -75,6 +75,7 @@
 */
 
 #include "vax_defs.h"
+#include "vax_jit.h"
 
 static const uint8 rcnt[128] = {
  0, 4, 4, 8, 4, 8, 8,12, 4, 8, 8,12, 8,12,12,16,        /* 00 - 0F */
@@ -1311,6 +1312,7 @@ pme = (t >> 31) & 1;                                    /* restore PME */
 
 zap_tb (0);                                             /* clear process TB */
 set_map_reg ();
+vax_jit_epoch_bump ();                                  /* JIT cache invalid */
 sim_debug (LOG_CPU_P, &cpu_dev, ">>LDP: PC=%08x, PSL=%08x, SP=%08x, nPC=%08x, nPSL=%08x, nSP=%08x\n",
              PC, PSL, SP, newpc, newpsl, KSP);
 if (PSL & PSL_IS)                                       /* if istk, */
@@ -1458,6 +1460,7 @@ switch (prn) {                                          /* case on reg # */
         P0BR = val & BR_MASK;                           /* lw aligned */
         zap_tb (0);                                     /* clr proc TLB */
         set_map_reg ();
+        vax_jit_epoch_bump ();
         break;
 
     case MT_P0LR:                                       /* P0LR */
@@ -1465,6 +1468,7 @@ switch (prn) {                                          /* case on reg # */
         P0LR = val & LR_MASK;
         zap_tb (0);                                     /* clr proc TLB */
         set_map_reg ();
+        vax_jit_epoch_bump ();
         break;
 
     case MT_P1BR:                                       /* P1BR */
@@ -1472,6 +1476,7 @@ switch (prn) {                                          /* case on reg # */
         P1BR = val & BR_MASK;                           /* lw aligned */
         zap_tb (0);                                     /* clr proc TLB */
         set_map_reg ();
+        vax_jit_epoch_bump ();
         break;
 
     case MT_P1LR:                                       /* P1LR */
@@ -1479,6 +1484,7 @@ switch (prn) {                                          /* case on reg # */
         P1LR = val & LR_MASK;
         zap_tb (0);                                     /* clr proc TLB */
         set_map_reg ();
+        vax_jit_epoch_bump ();
         break;
 
     case MT_SBR:                                        /* SBR */
@@ -1486,6 +1492,7 @@ switch (prn) {                                          /* case on reg # */
         SBR = val & BR_MASK;                            /* lw aligned */
         zap_tb (1);                                     /* clr entire TLB */
         set_map_reg ();
+        vax_jit_epoch_bump ();
         break;
 
     case MT_SLR:                                        /* SLR */
@@ -1493,6 +1500,7 @@ switch (prn) {                                          /* case on reg # */
         SLR = val & LR_MASK;
         zap_tb (1);                                     /* clr entire TLB */
         set_map_reg ();
+        vax_jit_epoch_bump ();
         break;
 
     case MT_SCBB:                                       /* SCBB */
@@ -1533,10 +1541,12 @@ switch (prn) {                                          /* case on reg # */
         /* fall through */
     case MT_TBIA:                                       /* TBIA */
         zap_tb (1);                                     /* clr entire TLB */
+        vax_jit_epoch_bump ();
         break;
 
     case MT_TBIS:                                       /* TBIS */
         zap_tb_ent (val);
+        vax_jit_epoch_bump ();
         break;
 
     case MT_TBCHK:                                      /* TBCHK */
