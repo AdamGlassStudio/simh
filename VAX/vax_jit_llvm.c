@@ -75,6 +75,11 @@ static CmpLFn  fn_cmpl;
 static TstLFn  fn_tstl;
 static NopFn   fn_nop;
 
+/* Address of the guest "mapen" flag (see vax_jit_llvm_register_mmu_state).
+   Baked into each compiled block as a constant pointer; JIT loads its
+   value at runtime to branch between inline fast-path and helper call. */
+static int32_t *mapen_ptr = NULL;
+
 /* ------------------------------------------------------------------ */
 /* Emitter context                                                     */
 /* ------------------------------------------------------------------ */
@@ -538,42 +543,161 @@ static void shadow_spill(LLVMBuilderRef b, LLVMTypeRef i32,
 /* Memory access helpers (VAX byte address -> M[addr>>2])              */
 /* ------------------------------------------------------------------ */
 
-/* Emit a call to vax_jit_mem_load_helper(regs, psl, mem, va, width).
-   Helper returns a zero-extended 32-bit value (byte/word are zero-extended). */
+/* Inline fast-path: direct host-memory load of width bytes at byte_addr,
+   zero-extended to i32. Mirrors the original (pre-helper) IR. */
+static LLVMValueRef emit_mem_load_inline(LLVMBuilderRef b, LLVMTypeRef i32,
+                                          LLVMValueRef mem,
+                                          LLVMValueRef byte_addr, int width)
+{
+    LLVMContextRef lctx = LLVMGetTypeContext(i32);
+    LLVMTypeRef i8  = LLVMInt8TypeInContext(lctx);
+    LLVMTypeRef i16 = LLVMInt16TypeInContext(lctx);
+    if (width == 1) {
+        LLVMValueRef ptr = LLVMBuildGEP2(b, i8, mem, &byte_addr, 1, "bp");
+        LLVMValueRef val = LLVMBuildLoad2(b, i8, ptr, "bv");
+        return LLVMBuildZExt(b, val, i32, "ze");
+    } else if (width == 2) {
+        LLVMValueRef ptr = LLVMBuildGEP2(b, i8, mem, &byte_addr, 1, "wp");
+        LLVMValueRef val = LLVMBuildLoad2(b, i16, ptr, "wv");
+        return LLVMBuildZExt(b, val, i32, "ze");
+    } else {
+        LLVMValueRef idx = LLVMBuildLShr(b, byte_addr, LLVMConstInt(i32, 2, 0), "wi");
+        LLVMValueRef ptr = LLVMBuildGEP2(b, i32, mem, &idx, 1, "mp");
+        return LLVMBuildLoad2(b, i32, ptr, "mv");
+    }
+}
+
+/* Inline fast-path store. */
+static void emit_mem_store_inline(LLVMBuilderRef b, LLVMTypeRef i32,
+                                   LLVMValueRef mem, LLVMValueRef byte_addr,
+                                   LLVMValueRef val, int width)
+{
+    LLVMContextRef lctx = LLVMGetTypeContext(i32);
+    LLVMTypeRef i8  = LLVMInt8TypeInContext(lctx);
+    LLVMTypeRef i16 = LLVMInt16TypeInContext(lctx);
+    if (width == 1) {
+        LLVMValueRef ptr = LLVMBuildGEP2(b, i8, mem, &byte_addr, 1, "bp");
+        LLVMValueRef trv = LLVMBuildTrunc(b, val, i8, "bt");
+        LLVMBuildStore(b, trv, ptr);
+    } else if (width == 2) {
+        LLVMValueRef ptr = LLVMBuildGEP2(b, i8, mem, &byte_addr, 1, "wp");
+        LLVMValueRef trv = LLVMBuildTrunc(b, val, i16, "wt");
+        LLVMBuildStore(b, trv, ptr);
+    } else {
+        LLVMValueRef idx = LLVMBuildLShr(b, byte_addr, LLVMConstInt(i32, 2, 0), "wi");
+        LLVMValueRef ptr = LLVMBuildGEP2(b, i32, mem, &idx, 1, "mp");
+        LLVMBuildStore(b, val, ptr);
+    }
+}
+
+/* Build IR that loads *mapen_ptr at runtime and returns an i1: 1 if the
+   guest MMU is enabled, 0 if not. mapen_ptr's address is baked into the
+   IR as a constant; this works because cpu_state lives at a stable
+   global address. Returns NULL if mapen_ptr was never registered (in
+   which case the caller skips the runtime check and always inlines). */
+static LLVMValueRef emit_mmu_on_check(LLVMBuilderRef b, LLVMTypeRef i32)
+{
+    if (!mapen_ptr) return NULL;
+    LLVMContextRef lctx = LLVMGetTypeContext(i32);
+    LLVMTypeRef    i64  = LLVMInt64TypeInContext(lctx);
+    LLVMTypeRef    pi32 = LLVMPointerTypeInContext(lctx, 0);
+    LLVMValueRef   addr = LLVMConstInt(i64, (uint64_t)(uintptr_t)mapen_ptr, 0);
+    LLVMValueRef   p    = LLVMConstIntToPtr(addr, pi32);
+    LLVMValueRef   v    = LLVMBuildLoad2(b, i32, p, "mapen");
+    return LLVMBuildICmp(b, LLVMIntNE, v, LLVMConstInt(i32, 0, 0), "mmu_on");
+}
+
+/* Emit a memory load with inline fast-path + helper fallback.
+   IR shape:
+     %mmu_on = load *mapen != 0
+     br i1 %mmu_on, label %slow, label %fast
+   fast:                       ; MMU off: direct host-memory access
+     %fv = inline load
+     br label %cont
+   slow:                       ; MMU on: call helper (does translation)
+     %sv = call vax_jit_mem_load_helper(...)
+     br label %cont
+   cont:
+     %v  = phi [%fv, %fast], [%sv, %slow] */
 static LLVMValueRef emit_mem_load(LLVMBuilderRef b, LLVMTypeRef i32,
                                    LLVMValueRef mem, LLVMValueRef byte_addr,
                                    int width, EmitCtx *ctx)
 {
-    LLVMModuleRef mod = LLVMGetGlobalParent(LLVMGetBasicBlockParent(
-                            LLVMGetInsertBlock(b)));
-    LLVMTypeRef   ptr = LLVMPointerTypeInContext(LLVMGetTypeContext(i32), 0);
+    LLVMValueRef mmu_on = emit_mmu_on_check(b, i32);
+    if (!mmu_on)
+        return emit_mem_load_inline(b, i32, mem, byte_addr, width);
+
+    LLVMContextRef    lctx = LLVMGetTypeContext(i32);
+    LLVMValueRef      fn   = LLVMGetBasicBlockParent(LLVMGetInsertBlock(b));
+    LLVMBasicBlockRef fast = LLVMAppendBasicBlockInContext(lctx, fn, "mld_fast");
+    LLVMBasicBlockRef slow = LLVMAppendBasicBlockInContext(lctx, fn, "mld_slow");
+    LLVMBasicBlockRef cont = LLVMAppendBasicBlockInContext(lctx, fn, "mld_cont");
+    LLVMBuildCondBr(b, mmu_on, slow, fast);
+
+    LLVMPositionBuilderAtEnd(b, fast);
+    LLVMValueRef fv = emit_mem_load_inline(b, i32, mem, byte_addr, width);
+    LLVMBasicBlockRef fast_end = LLVMGetInsertBlock(b);
+    LLVMBuildBr(b, cont);
+
+    LLVMPositionBuilderAtEnd(b, slow);
+    LLVMModuleRef mod    = LLVMGetGlobalParent(fn);
+    LLVMTypeRef   ptr    = LLVMPointerTypeInContext(lctx, 0);
     LLVMTypeRef   parms[5] = { ptr, ptr, ptr, i32, i32 };
-    LLVMTypeRef   fn_ty = LLVMFunctionType(i32, parms, 5, 0);
-    LLVMValueRef  fn = LLVMGetNamedFunction(mod, "vax_jit_mem_load_helper");
-    if (!fn)
-        fn = LLVMAddFunction(mod, "vax_jit_mem_load_helper", fn_ty);
+    LLVMTypeRef   fn_ty  = LLVMFunctionType(i32, parms, 5, 0);
+    LLVMValueRef  hfn    = LLVMGetNamedFunction(mod, "vax_jit_mem_load_helper");
+    if (!hfn)
+        hfn = LLVMAddFunction(mod, "vax_jit_mem_load_helper", fn_ty);
     LLVMValueRef args[5] = { ctx->regs, ctx->psl, mem, byte_addr,
                               LLVMConstInt(i32, (unsigned)width, 0) };
-    return LLVMBuildCall2(b, fn_ty, fn, args, 5, "ml");
+    LLVMValueRef sv = LLVMBuildCall2(b, fn_ty, hfn, args, 5, "ml");
+    LLVMBasicBlockRef slow_end = LLVMGetInsertBlock(b);
+    LLVMBuildBr(b, cont);
+
+    LLVMPositionBuilderAtEnd(b, cont);
+    LLVMValueRef phi = LLVMBuildPhi(b, i32, "mlv");
+    LLVMValueRef in_vals[2] = { fv, sv };
+    LLVMBasicBlockRef in_bbs[2] = { fast_end, slow_end };
+    LLVMAddIncoming(phi, in_vals, in_bbs, 2);
+    return phi;
 }
 
-/* Emit a call to vax_jit_mem_store_helper(regs, psl, mem, va, val, width). */
+/* Emit a memory store with inline fast-path + helper fallback (no phi). */
 static void emit_mem_store(LLVMBuilderRef b, LLVMTypeRef i32,
                             LLVMValueRef mem, LLVMValueRef byte_addr,
                             LLVMValueRef val, int width, EmitCtx *ctx)
 {
-    LLVMModuleRef mod = LLVMGetGlobalParent(LLVMGetBasicBlockParent(
-                            LLVMGetInsertBlock(b)));
-    LLVMTypeRef   ptr = LLVMPointerTypeInContext(LLVMGetTypeContext(i32), 0);
+    LLVMValueRef mmu_on = emit_mmu_on_check(b, i32);
+    if (!mmu_on) {
+        emit_mem_store_inline(b, i32, mem, byte_addr, val, width);
+        return;
+    }
+
+    LLVMContextRef    lctx = LLVMGetTypeContext(i32);
+    LLVMValueRef      fn   = LLVMGetBasicBlockParent(LLVMGetInsertBlock(b));
+    LLVMBasicBlockRef fast = LLVMAppendBasicBlockInContext(lctx, fn, "mst_fast");
+    LLVMBasicBlockRef slow = LLVMAppendBasicBlockInContext(lctx, fn, "mst_slow");
+    LLVMBasicBlockRef cont = LLVMAppendBasicBlockInContext(lctx, fn, "mst_cont");
+    LLVMBuildCondBr(b, mmu_on, slow, fast);
+
+    LLVMPositionBuilderAtEnd(b, fast);
+    emit_mem_store_inline(b, i32, mem, byte_addr, val, width);
+    LLVMBuildBr(b, cont);
+
+    LLVMPositionBuilderAtEnd(b, slow);
+    LLVMModuleRef mod    = LLVMGetGlobalParent(fn);
+    LLVMTypeRef   ptr    = LLVMPointerTypeInContext(lctx, 0);
     LLVMTypeRef   parms[6] = { ptr, ptr, ptr, i32, i32, i32 };
-    LLVMTypeRef   fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(
-                              LLVMGetTypeContext(i32)), parms, 6, 0);
-    LLVMValueRef  fn = LLVMGetNamedFunction(mod, "vax_jit_mem_store_helper");
-    if (!fn)
-        fn = LLVMAddFunction(mod, "vax_jit_mem_store_helper", fn_ty);
+    LLVMTypeRef   fn_ty  = LLVMFunctionType(LLVMVoidTypeInContext(lctx),
+                                            parms, 6, 0);
+    LLVMValueRef  hfn    = LLVMGetNamedFunction(mod, "vax_jit_mem_store_helper");
+    if (!hfn)
+        hfn = LLVMAddFunction(mod, "vax_jit_mem_store_helper", fn_ty);
     LLVMValueRef args[6] = { ctx->regs, ctx->psl, mem, byte_addr, val,
                               LLVMConstInt(i32, (unsigned)width, 0) };
-    LLVMBuildCall2(b, fn_ty, fn, args, 6, "");
+    LLVMBuildCall2(b, fn_ty, hfn, args, 6, "");
+    LLVMBuildBr(b, cont);
+
+    LLVMPositionBuilderAtEnd(b, cont);
 }
 
 /* Compute effective byte address for a memory operand.
@@ -2313,6 +2437,11 @@ void vax_jit_llvm_register_mem_helpers(void *load_fn, void *store_fn)
         fprintf(stderr, "vax_jit: failed to register mem helpers: %s\n", msg);
         LLVMDisposeErrorMessage(msg);
     }
+}
+
+void vax_jit_llvm_register_mmu_state(int32_t *p)
+{
+    mapen_ptr = p;
 }
 
 /* ------------------------------------------------------------------ */

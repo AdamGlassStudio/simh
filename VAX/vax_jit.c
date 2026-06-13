@@ -545,6 +545,7 @@ int vax_jit_init(void)
     vax_jit_llvm_register_mem_helpers(
         (void *)vax_jit_mem_load_helper_impl,
         (void *)vax_jit_mem_store_helper_impl);
+    vax_jit_llvm_register_mmu_state(&mapen);
     return 0;
 }
 void vax_jit_destroy(void) { vax_jit_llvm_destroy(); }

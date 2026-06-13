@@ -132,6 +132,13 @@ void vax_jit_llvm_register_misc_helpers (void *extzv_fn, void *insv_fn, void *mo
    Must be called after vax_jit_llvm_init(). */
 void vax_jit_llvm_register_mem_helpers (void *load_fn, void *store_fn);
 
+/* Register pointer to the guest "mapen" flag (MMU enable). The JIT
+   bakes this address into each compiled block and branches on its
+   runtime value at every memory access: 0 -> inline fast path,
+   non-zero -> call the registered mem helper.
+   Must be called after vax_jit_llvm_init(). */
+void vax_jit_llvm_register_mmu_state (int32_t *mapen_ptr);
+
 /* Execute an already-compiled block function pointer. */
 void vax_jit_llvm_run_block (void *fn, int32_t *regs, int32_t *psl,
                               int32_t *mem, int32_t *sim_interval);
